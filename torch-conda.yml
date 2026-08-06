@@ -1,0 +1,31 @@
+# name: torch-base
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+    - python=3.11
+    - pip>=19.0
+    - pytorch 
+    - torchvision 
+    - torchtext
+    - torchaudio
+    - jupyter
+    - scikit-learn
+    - scipy
+    - pandas
+    - pandas-datareader
+    - matplotlib
+    - seaborn
+    - pillow
+    - tqdm
+    - requests
+    - h5py
+    - pyyaml
+    - flask
+    - boto3
+    - ipykernel
+    - pip:
+        - bayesian-optimization
+        - gym
+        - kaggle
+        
