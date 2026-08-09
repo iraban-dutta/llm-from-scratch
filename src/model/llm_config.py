@@ -8,7 +8,11 @@ class LLMConfig:
     ctx_len:int=8
     d_model:int=32
     n_layer:int=2
+    ff_ratio:int=4
+    dropout:float=0.0
+    eps:float=1e-5
 
+    
     # Components
     position_embedding:str='sinusoidal'
     rotary_embedding:bool=False
@@ -18,8 +22,10 @@ class LLMConfig:
     # Attention
     n_heads: int = 4
     n_groups: int | None = None
+    use_flash: bool = False
+    attn_debug: bool = False
 
-
+    
     def __post_init__(self):
 
         # Run validation checks on the config passed
@@ -39,6 +45,8 @@ class LLMConfig:
             raise ValueError("d_model must be even.")
         if self.n_layer <= 0:
             raise ValueError("n_layer must be > 0.")
+        if self.ff_ratio <= 0:
+            raise ValueError("ff_ratio must be > 0.")
         if self.n_heads <= 0:
             raise ValueError("n_heads must be > 0.")
         if self.d_model % self.n_heads != 0:
@@ -46,6 +54,11 @@ class LLMConfig:
                 f"d_model ({self.d_model}) must be divisible by "
                 f"n_heads ({self.n_heads})."
             )
+        if self.dropout < 0 or self.dropout > 1:
+            raise ValueError("dropout must be within [0, 1].")
+        if self.eps <= 0:
+            raise ValueError("eps must be > 0.")
+
 
         # ======== VALIDATE COMPONENTS ========
         # Validate position_embedding
@@ -110,3 +123,8 @@ class LLMConfig:
                     )
             case "mhla":
                 pass
+
+        if self.use_flash and self.attn_debug:
+            raise ValueError("Flash Attention not to be used in debug mode.")
+        if self.use_flash and self.rotary_embedding:
+            raise ValueError("Flash Attention not supported with RoPE.")

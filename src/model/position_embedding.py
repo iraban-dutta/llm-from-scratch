@@ -30,18 +30,8 @@ class SinusoidalPositionalEncoding(nn.Module):
         # x.shape = (B, T, d_model)
         B, T, d_model = x.shape
 
-        # Basic checks
-        # T <= self.ctx_len
-        if T>self.ctx_len:
-            raise ValueError(
-                f"Input shape: {tuple(x.shape)}"
-                f"Sequence length in x={T} is should be lesser than max context length of model {self.ctx_len}"
-            )
-        # d_model == self.d_model
-        assert d_model == self.d_model, (
-            f"Input shape: {tuple(x.shape)}"
-            f"d_model in x={d_model} should match with embeddinbg dim of model {self.d_model}"
-        )
+        # Move PE to same device as x
+        self.PE = self.PE.to(x.device)
 
         # We slice the PE tensor to match the #seqeunces in x
         # this is because the sequence length in x can vary from [1, ctx_len]
@@ -67,7 +57,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class LearnedPostionalEmbedding(nn.Module):
-
+    
     def __init__(self, config:LLMConfig):
         super().__init__()
         self.PE = nn.Embedding(config.ctx_len, config.d_model)
@@ -75,6 +65,10 @@ class LearnedPostionalEmbedding(nn.Module):
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         # x.shape = (B, T, d_model)
         B, T, d_model = x.shape
+
+        # Move PE to same device as x
+        self.PE = self.PE.to(x.device)
+        
         return x + self.PE(torch.arange(T))
 
 
