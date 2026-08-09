@@ -7,10 +7,10 @@ from .llm_config import LLMConfig
 
 
 class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, ctx_len:int, d_model:int):
+    def __init__(self, config:LLMConfig):
         super().__init__()
-        self.ctx_len=ctx_len
-        self.d_model=d_model
+        self.ctx_len=config.ctx_len
+        self.d_model=config.d_model
         self.PE = self._get_positional_encoding()
 
     def _get_positional_encoding(self) -> torch.Tensor:
@@ -68,9 +68,9 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 class LearnedPostionalEmbedding(nn.Module):
 
-    def __init__(self, ctx_len, d_model):
+    def __init__(self, config:LLMConfig):
         super().__init__()
-        self.PE = nn.Embedding(ctx_len, d_model)
+        self.PE = nn.Embedding(config.ctx_len, config.d_model)
 
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         # x.shape = (B, T, d_model)
@@ -84,15 +84,9 @@ def build_position_embedding(config:LLMConfig) -> nn.Module:
     match config.position_embedding:
 
         case "sinusoidal":
-            return SinusoidalPositionalEncoding(
-                config.ctx_len,
-                config.d_model,
-            )
+            return SinusoidalPositionalEncoding(config)
         case "learned":
-            return LearnedPostionalEmbedding(
-                config.ctx_len,
-                config.d_model,
-            )
+            return LearnedPostionalEmbedding(config)
         case "identity":
             return nn.Identity()
 
@@ -103,10 +97,15 @@ if __name__=='__main__':
     # Test SinusoidalPostionalEncoding()
     ctx_len=50
     d_model=32
-    x = torch.randn(2, ctx_len, d_model)
-    pos_enc = SinusoidalPositionalEncoding(ctx_len, d_model)
+    config = LLMConfig(
+        ctx_len=ctx_len, 
+        d_model=d_model
+    )
+
+    pos_enc = SinusoidalPositionalEncoding(config)
     print(pos_enc)
 
+    x = torch.randn(2, ctx_len, d_model)
     print(x.shape)
     x = pos_enc(x)
     print(x.shape)
