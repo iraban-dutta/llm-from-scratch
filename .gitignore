@@ -1,6 +1,8 @@
 # Self added
 data/
 !src/data
+.DS_Store
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
