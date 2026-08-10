@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import numpy as np
 from .tokenizer import tokenize_tinystories
+from src.config.test import TOKENIZERS_SUPPORTED
 
 
 def iter_jsonl(filepath):
@@ -11,6 +12,10 @@ def iter_jsonl(filepath):
 
 
 def tokenize_save_binary(loadfile_path:Path, savefile_name:str, chunk_size:int=100, tokenizer:str='gpt2') -> None:
+
+    assert tokenizer in TOKENIZERS_SUPPORTED, (
+        f"Invalid tokenizer: {tokenizer}. Tokenizers supported: {TOKENIZERS_SUPPORTED}"
+    )
 
     print('='*50)
     print(f'Tokenizing {loadfile_path.name} and saving in .bin format')
@@ -28,8 +33,9 @@ def tokenize_save_binary(loadfile_path:Path, savefile_name:str, chunk_size:int=1
     else:
 
         # Define Tokenizer
-        import tiktoken
-        enc=tiktoken.get_encoding(tokenizer)
+        if tokenizer=='gpt2':
+            import tiktoken
+            enc=tiktoken.get_encoding(tokenizer)
 
         # Tokenize and save binary file in chunks
         

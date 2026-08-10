@@ -7,14 +7,20 @@ from src.config.test import SAMPLING_STRATEGIES, TOKENIZERS_SUPPORTED
 
 
 class Sampler:
-    def __init__(self, strategy:str, temperature:int, top_k:int):
-        self.temperature=temperature
-        self.top_k=top_k
+    def __init__(self, strategy:str, temperature:float, top_k:int):
 
+        # Validate temperature
+        if temperature <= 0:
+            raise ValueError(
+                f"Temperature must be > 0, got {temperature}"
+            )
         # Validate strategy
         assert strategy in SAMPLING_STRATEGIES, (
             f"Invalid sampling strategy: {strategy}. Sampling strategies supported: {SAMPLING_STRATEGIES}"
         )
+
+        self.temperature=temperature
+        self.top_k=top_k
         self.strategy=strategy
         self._sampling_function = {
             'greedy': self._greedy,
@@ -52,7 +58,7 @@ class Sampler:
         logits_last = logits[:, -1, :]
 
         # Adjust for temperature
-        logits_last *= (1/self.temperature)
+        logits_last = (1/self.temperature) * logits_last
 
         # Softmax: Shape = (B, vocab_size)
         probs_last = F.softmax(logits_last, dim=-1)
@@ -71,7 +77,7 @@ class Sampler:
         logits_last = logits[:, -1, :]
 
         # Adjust for temperature
-        logits_last *= (1/self.temperature)
+        logits_last = (1/self.temperature) * logits_last
 
         # Get topk idxs
         topk_vals, topk_idxs = torch.topk(logits_last, k=self.top_k, dim=-1)
@@ -96,7 +102,7 @@ class TextGeneratorConfig:
     max_new_tokens:int
     tokenizer:str='gpt2'
     strategy:str='topk'
-    temperature:int=1
+    temperature:float=1.0
     top_k:int=50
     
 
@@ -137,21 +143,21 @@ class TextGenerator:
         # Resolve device and move x_tokens to device
         x_tokens = x_tokens.to(next(self.model.parameters()).device)
 
-        # AutoRegressive Generation
-        for i in range(self.max_new_tokens):
+        with torch.no_grad():
+            # AutoRegressive Generation
+            for i in range(self.max_new_tokens):
 
-            # If max ctx_len is reached, then slide context over the latest tokens
-            x_tokens_fwd = x_tokens[:, -(self.model.config.ctx_len):]
+                # If max ctx_len is reached, then slide context over the latest tokens
+                x_tokens_fwd = x_tokens[:, -(self.model.config.ctx_len):]
 
-            # Model Forward pass: Shape = (num_samples, T, vocab_size)
-            with torch.no_grad():
+                # Model Forward pass: Shape = (num_samples, T, vocab_size)
                 logits = self.model(x_tokens_fwd)
 
-            # Next token: Shape = (num_samples, 1)
-            next_token = self.sampler.sample_next_token(logits, generator)
+                # Next token: Shape = (num_samples, 1)
+                next_token = self.sampler.sample_next_token(logits, generator)
 
-            # Append to old prompt: Shape = (num_samples, T+i)
-            x_tokens = torch.cat([x_tokens, next_token], dim=-1)
+                # Append to old prompt: Shape = (num_samples, T+i)
+                x_tokens = torch.cat([x_tokens, next_token], dim=-1)
 
         out = list(map(lambda x: self._decode_tokens(x.tolist()), x_tokens))
         return out    
@@ -208,7 +214,7 @@ if __name__=='__main__':
         max_new_tokens=10,
         tokenizer='gpt2',
         strategy='topk',
-        temperature=1,
+        temperature=1.0,
         top_k=50
     )
 
