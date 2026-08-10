@@ -24,23 +24,14 @@ class LLM(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size)
 
 
-    def _resolve_device(self):
-        device = 'cpu'
-        if torch.cuda.is_available():
-            device='cuda'
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            device='mps'
-        return device
-
-
     def forward(self, x:torch.Tensor, y:None|torch.Tensor=None) -> torch.Tensor:
 
         # x.shape = (B, T)
         B, T = x.shape
 
         # Resolve Device and move input to device
-        x = x.to(self._resolve_device())
-        print(f"Moved input to {device}")
+        x = x.to(next(self.parameters()).device)
+        # print(f"Moved input to {device}")
 
         # Check for context overflow: T <= ctx_len
         assert T<=self.config.ctx_len, (
