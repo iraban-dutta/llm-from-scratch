@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 import numpy as np
 from .tokenizer import tokenize_tinystories
-from src.config.test import TOKENIZERS_SUPPORTED
+from config.test import TOKENIZERS_SUPPORTED
 
 
 def iter_jsonl(filepath):

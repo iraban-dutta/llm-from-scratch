@@ -46,8 +46,13 @@ class LLM(nn.Module):
         for decoder in self.transformer.dec:
             x=decoder(x)
         x = self.transformer.ln_final(x)
-        x = self.lm_head(x)
-        return x
+        logits = self.lm_head(x)
+
+        loss = None
+        if y is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+
+        return logits, loss
 
 
 if __name__=='__main__':
@@ -112,7 +117,7 @@ if __name__=='__main__':
     g=torch.Generator(device=device).manual_seed(42)
     x = torch.randint(low=0, high=50256, size=(16, ctx_len), generator=g, device=device)
     print(x.shape, x.device)
-    x = model(x)
+    x, _ = model(x)
     print(x.shape, x.device)
     print('-'*50)
 

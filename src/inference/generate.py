@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from src.model.llm_config import LLMConfig
 from src.model.llm import LLM
-from src.config.test import SAMPLING_STRATEGIES, TOKENIZERS_SUPPORTED
+from config.test import SAMPLING_STRATEGIES, TOKENIZERS_SUPPORTED
 
 
 class Sampler:
@@ -151,7 +151,7 @@ class TextGenerator:
                 x_tokens_fwd = x_tokens[:, -(self.model.config.ctx_len):]
 
                 # Model Forward pass: Shape = (num_samples, T, vocab_size)
-                logits = self.model(x_tokens_fwd)
+                logits, _ = self.model(x_tokens_fwd)
 
                 # Next token: Shape = (num_samples, 1)
                 next_token = self.sampler.sample_next_token(logits, generator)
@@ -218,7 +218,7 @@ if __name__=='__main__':
         top_k=50
     )
 
-    # Instantiate model
+    # Instantiate generator
     text_generator = TextGenerator(text_gen_config)
 
 
