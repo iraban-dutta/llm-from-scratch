@@ -74,6 +74,7 @@ class LLMTrainerConfig:
     eval_steps: int    = 16*32 # (16X of train batch size)
 
     # Checkpointing
+    to_save_checkpoint: bool = False
     checkpoint_interval: int = 500
     curr_datetime = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     checkpoint_dir: str = f"./checkpoints/{curr_datetime}"
@@ -101,7 +102,7 @@ class LLMTrainer:
         config:LLMTrainerConfig, 
         model:nn.Module,
         train_loader:TokenBatchLoader,
-        val_loader:TokenBatchLoader
+        val_loader:TokenBatchLoader | None
     ):
         # Traing Configs/Hyperparams
         self.config=config
@@ -119,6 +120,8 @@ class LLMTrainer:
         )
         # Track current step of update
         self.step=0
+        # Track best val loss
+        self.best_val_loss = torch.inf
 
     def _resolve_device(self) -> torch.device:
 
@@ -158,11 +161,12 @@ class LLMTrainer:
         pass
 
 
-    def model_eval(self) -> float:
+    def evaluate_model(self) -> float:
 
+        # Dont track grads for eval
         with torch.no_grad():
 
-            # For evaluating over the same #eval_steps batches - Comment our
+            # For evaluating over the same #eval_steps batches - Comment out
             self.val_loader.curr_idx = 0
 
             # Set model to eval mode
@@ -183,11 +187,7 @@ class LLMTrainer:
         return (val_loss/self.config.eval_steps)
 
 
-    def train(self):
-
-        val_loss, min_val_loss = 0.0, torch.inf
-        # Train Loop
-        while self.step < self.config.num_steps:
+    def train_step(self):
 
             # Load Data (x,y) and move tensors to device
             x, y = self.train_loader.next_batch()
@@ -205,32 +205,42 @@ class LLMTrainer:
             # Optimizer Step
             self.optimizer.step()
 
+            return loss.item()
+
+    def train(self):
+
+        val_loss = 0.0
+        # Train Loop
+        while self.step < self.config.num_steps:
+
+            # Perfom 1 unit of train step
+            train_loss = self.train_step()
 
             # Logging
             if self.step % self.config.eval_interval == 0:
-                val_loss = self.model_eval()
-                print(f"Step: {self.step}, Loss: {loss.item():.4f}, Val_Loss: {val_loss:.4f}")
+                val_loss = self.evaluate_model()
+                print(f"Step: {self.step}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
                 # Best Val loss obtained
-                if val_loss < min_val_loss:
+                if self.config.to_save_checkpoint and val_loss < self.best_val_loss:
                     self.save_checkpoint(filename='best.pt') # best.pt saved
-                    min_val_loss = val_loss
+                    self.best_val_loss = val_loss
             elif self.step % self.config.log_interval == 0:
-                print(f"Step: {self.step}, Loss: {loss.item():.4f}")
+                print(f"Step: {self.step}, Loss: {train_loss:.4f}")
 
             # Checkpointing
-            if self.step % self.config.checkpoint_interval == 0:
+            if self.config.to_save_checkpoint and self.step % self.config.checkpoint_interval == 0:
                 self.save_checkpoint(filename='latest.pt') # latest.pt saved
 
             # Update step attribute    
             self.step += 1
 
         # Final Logging
-        val_loss = self.model_eval()
-        print(f"Step: {self.step}, Loss: {loss.item():.4f}, Val_Loss: {val_loss:.4f}")
+        val_loss = self.evaluate_model()
+        print(f"Step: {self.step}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
         # Best Val loss obtained
-        if val_loss < min_val_loss:
+        if self.config.to_save_checkpoint and val_loss < self.best_val_loss:
             self.save_checkpoint(filename='best.pt') # best.pt saved
-            min_val_loss = val_loss
+            self.best_val_loss = val_loss
         
 
 
@@ -247,12 +257,13 @@ if __name__=='__main__':
     # ======== DEFINE Model Config ========
     llm_config = LLMConfig(
         vocab_size=50257,
-        ctx_len=126,
+        ctx_len=128,
         d_model=384, 
         n_layer=4,
         ff_ratio=4,
         dropout=0.0,
         eps=1e-5,
+        bias=False,
         position_embedding='sinusoidal',
         rotary_embedding=False,
         attention='mha',
@@ -272,9 +283,10 @@ if __name__=='__main__':
         batch_size=4,
         learning_rate=3e-4,
         log_interval=5,
-        eval_interval=40,
+        eval_interval=50,
         eval_steps=32,
-        checkpoint_interval=25,
+        to_save_checkpoint=False,
+        checkpoint_interval=50,
         device='auto'
     )
     print(llm_config)
