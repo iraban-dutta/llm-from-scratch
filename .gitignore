@@ -3,6 +3,7 @@ data/
 !src/data
 .DS_Store
 .vscode/
+notebooks/sample.*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
