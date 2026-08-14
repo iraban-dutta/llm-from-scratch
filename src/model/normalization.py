@@ -8,7 +8,7 @@ class LayerNorm(nn.Module):
     def __init__(self, config:LLMConfig):
         super().__init__()
         self.gamma=nn.Parameter(torch.ones(config.d_model))
-        self.beta=nn.Parameter(torch.zeros(config.d_model))
+        self.beta=nn.Parameter(torch.zeros(config.d_model)) if config.bias else None
         self.eps=config.eps
 
     def forward(self, x:torch.Tensor) -> torch.Tensor:
@@ -18,7 +18,10 @@ class LayerNorm(nn.Module):
         l_var = x.var(dim=-1, keepdim=True, unbiased=False) # l_var.shape  = (B, T, 1)
 
         x = (x - l_mean)/((l_var+self.eps)**0.5)
-        x = (x * self.gamma) + self.beta
+        x = x * self.gamma
+
+        if self.beta is not None:
+            x = x + self.beta
 
         return x
 
@@ -32,6 +35,7 @@ if __name__=='__main__':
     config = LLMConfig(
         d_model=d_model,
         eps=eps, 
+        bias=True,
         normalization=normalization, 
     )
     ln = LayerNorm(config)

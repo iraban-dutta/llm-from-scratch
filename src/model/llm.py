@@ -68,6 +68,7 @@ if __name__=='__main__':
         ff_ratio=4,
         dropout=0.0,
         eps=1e-5,
+        bias=False,
         position_embedding='sinusoidal',
         rotary_embedding=False,
         attention='mha',

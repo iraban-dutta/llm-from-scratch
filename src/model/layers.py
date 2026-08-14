@@ -9,9 +9,9 @@ from .normalization import LayerNorm
 class MLP(nn.Module):
     def __init__(self, config:LLMConfig):
         super().__init__()
-        self.ff1=nn.Linear(config.d_model, config.ff_ratio*config.d_model)
+        self.ff1=nn.Linear(in_features=config.d_model, out_features=config.ff_ratio*config.d_model, bias=config.bias)
         self.gelu=nn.GELU(approximate='tanh')
-        self.ff2=nn.Linear(config.ff_ratio*config.d_model, config.d_model)
+        self.ff2=nn.Linear(in_features=config.ff_ratio*config.d_model, out_features=config.d_model, bias=config.bias)
 
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         x = self.ff1(x)

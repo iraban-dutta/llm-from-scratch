@@ -11,6 +11,7 @@ class LLMConfig:
     ff_ratio:int=4
     dropout:float=0.0
     eps:float=1e-5
+    bias:bool=True
 
     
     # Components
