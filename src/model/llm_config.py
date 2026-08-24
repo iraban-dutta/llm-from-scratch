@@ -81,7 +81,6 @@ class LLMConfig:
         # Validate attention
         valid_attention = {
             "mha",
-            "mqa",
             "gqa",
             "mhla",
         }
@@ -107,8 +106,6 @@ class LLMConfig:
 
             case "mha":
                 pass
-            case "mqa":
-                pass
             case "gqa":
                 if self.n_groups is None:
                     raise ValueError(
@@ -127,5 +124,5 @@ class LLMConfig:
 
         if self.use_flash and self.attn_debug:
             raise ValueError("Flash Attention not to be used in debug mode.")
-        if self.use_flash and self.rotary_embedding:
-            raise ValueError("Flash Attention not supported with RoPE.")
+        # if self.use_flash and self.rotary_embedding:
+        #     raise ValueError("Flash Attention not supported with RoPE.")

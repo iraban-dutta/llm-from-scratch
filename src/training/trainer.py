@@ -1,4 +1,10 @@
+# ISSUE: Low Batch size (B=4) 
+# Triggering train() on mps sometimes is causing grad_norm to go high
+# Behaviour is non-deterministic - hard to reproduce, Increasing Batch Size makes it a bit more stable
+
+import time
 from pathlib import Path
+from typing import Any
 from datetime import datetime
 from dataclasses import dataclass
 import numpy as np
@@ -61,10 +67,18 @@ class LLMTrainerConfig:
     batch_size:int=32
 
     # Optimizer
-    learning_rate:float = 1e-4
-    # weight_decay: float = 0.01
-    # beta1: float = 0.9
-    # beta2: float = 0.95
+    learning_rate:float = 3e-4
+    weight_decay: float = 0.01
+    beta1: float = 0.9
+    beta2: float = 0.95
+
+    # LR Scheduler
+    use_lr_scheduler: bool = False
+    warmup_steps: int = 15
+    min_lr: float = 0.1*3e-4
+
+    # Gradient clipping
+    grad_clip: float = 1.0
 
     # Logging
     log_interval: int = 10
@@ -85,16 +99,6 @@ class LLMTrainerConfig:
     # Early stopping
     # early_stopping_patience: int | None = None
     
-    # # Scheduler
-    # warmup_steps: int = ...
-    # min_lr: float = ...
-
-    # # Gradient handling
-    # grad_clip: float = 1.0
-
-
-
-
 
 class LLMTrainer:
     def __init__(
@@ -114,14 +118,15 @@ class LLMTrainer:
         self.train_loader=train_loader
         self.val_loader=val_loader
         # Define Optimizer
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr =self.config.learning_rate
-        )
+        self.optimizer = self._configure_optimizer()
         # Track current step of update
         self.step=0
         # Track best val loss
         self.best_val_loss = torch.inf
+        # Track Loss over steps
+        self.train_loss_hist = []
+        self.val_loss_hist   = []
+
 
     def _resolve_device(self) -> torch.device:
 
@@ -134,31 +139,31 @@ class LLMTrainer:
         return torch.device('cpu')
 
 
-    def save_checkpoint(self, filename:str='latest.pt') -> None:
+    def _configure_optimizer(self):
+        param_dict = {pn:p for pn, p in self.model.named_parameters() if p.requires_grad==True}
 
-        ckpt_path = Path(self.config.checkpoint_dir)
-        ckpt_path.mkdir(parents=True, exist_ok=True)
-        ckpt_path = ckpt_path/filename
+        decay_params = [p for pn, p in param_dict.items() if p.ndim>=2]
+        non_decay_params = [p for pn, p in param_dict.items() if p.ndim<2]
+        num_decay_params = sum(p.nelement() for p in decay_params)
+        num_non_decay_params = sum(p.nelement() for p in non_decay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(non_decay_params)}, with {num_non_decay_params:,} parameters")
+        per_param_groups = [
+            {'params': decay_params, 'weight_decay': self.config.weight_decay},
+            {'params': non_decay_params, 'weight_decay': 0.0}
+        ]
 
-        checkpoint = {
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "model_config": self.model.config,
-            "train_config": self.config,
-            "step": self.step,                             # Num of update steps while training
-            "train_loader_state": {
-                "curr_idx": self.train_loader.curr_idx,    # Store the curr_idx of train_loader - so that we resume form the same batch
-            },
-            "rng_state": torch.get_rng_state(),            # While loading: torch.set_rng_state(checkpoint["rng_state"])
-        }
+        # Define optimizer
+        # use 'fused' if device is cuda: Supports a fused kernel for all parameter updates
+        use_fused = self.device.type == "cuda"
+        optimizer = AdamW(
+            per_param_groups, 
+            lr=self.config.learning_rate,
+            betas=(self.config.beta1, self.config.beta2),
+            fused=use_fused
+        )
 
-        torch.save(checkpoint, ckpt_path)
-        print(f"Checkpoint saved: {ckpt_path}")
-        
-
-
-    def load_checkpoint(self):
-        pass
+        return optimizer
 
 
     def evaluate_model(self) -> float:
@@ -187,6 +192,24 @@ class LLMTrainer:
         return (val_loss/self.config.eval_steps)
 
 
+    def _get_lr(self, init_lr:float, final_lr:float, max_step:int, warmup_steps:int, curr_step:int):
+        
+        assert final_lr>0 and 0<(final_lr/init_lr)<1, (
+            f"LRs should be > 0. Also final LR should be less than inital LR, got values: initial LR: {init_lr} & final LR: {final_lr}"
+        )
+        warmup_steps_reslv = min(warmup_steps, int(0.05*max_step))
+        if curr_step<warmup_steps_reslv:
+            # Linear Warmup
+            return init_lr*((curr_step+1)/warmup_steps_reslv)
+        elif curr_step>max_step:
+            # Keep training with final_lr
+            return final_lr
+
+        # Cosine Decay (From warmup_step to max_step)
+        cosine_curve = 0.5*(np.cos((np.pi/(max_step-warmup_steps_reslv))*(curr_step-warmup_steps_reslv)) + 1)
+        return (init_lr-final_lr)*cosine_curve + final_lr
+
+
     def train_step(self):
 
             # Load Data (x,y) and move tensors to device
@@ -195,17 +218,42 @@ class LLMTrainer:
 
             # Zero out gradients
             self.optimizer.zero_grad()
-
+            
             # Forward pass
             logits, loss = self.model(x, y)
 
             # Backward Pass
             loss.backward()
 
+            # Clip gardient norm
+            # Computes the global norm across all parameter grads
+            # if ||g|| > max_norm, each grad is scaled: g_i = g_i * max_norm / ||g|| 
+            # The function returns the PRE-clipping global norm.
+            global_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=self.config.grad_clip, norm_type=2)
+
+            # DEBUG: Grad norm without clipping
+            # global_grad_norm = sum(torch.linalg.norm(p)**2 for p in self.model.parameters())**0.5
+
+            # Added checks to raise RuntimeError or a warning for unsually large grad_norms
+            if not torch.isfinite(global_grad_norm):
+                raise RuntimeError(
+                    f"Non-finite gradient norm at step {self.step}: "
+                    f"{global_grad_norm.item()}"
+                )
+
+            if global_grad_norm > 100:
+                print(
+                    f"WARNING: unusually large gradient norm "
+                    f"{global_grad_norm.item():.2f} at step {self.step}"
+                )
+
             # Optimizer Step
             self.optimizer.step()
 
-            return loss.item()
+
+
+            return loss.item(), global_grad_norm.item()
+
 
     def train(self):
 
@@ -213,19 +261,50 @@ class LLMTrainer:
         # Train Loop
         while self.step < self.config.num_steps:
 
+            if self.config.use_lr_scheduler:
+                # Set LR for current step
+                lr = self._get_lr(
+                    init_lr=self.config.learning_rate, 
+                    final_lr=self.config.min_lr, 
+                    max_step=self.config.num_steps, 
+                    warmup_steps=self.config.warmup_steps, 
+                    curr_step=self.step)
+
+                # Set lr in optimizer
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = lr
+            else:
+                lr = self.config.learning_rate
+
+            # Start time
+            step_start = time.perf_counter()
+
             # Perfom 1 unit of train step
-            train_loss = self.train_step()
+            train_loss, grad_norm = self.train_step()
+            self.train_loss_hist.append(train_loss)
+
+            # Synchronize
+            if self.device.type == 'mps':
+                torch.mps.synchronize()
+
+            # End time
+            step_end = time.perf_counter()
+
+            step_total_time = (step_end-step_start)
+            train_throughput = (self.config.batch_size*self.model.config.ctx_len)/step_total_time
+
 
             # Logging
             if self.step % self.config.eval_interval == 0:
                 val_loss = self.evaluate_model()
-                print(f"Step: {self.step}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
+                self.val_loss_hist.append(val_loss)
+                print(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
                 # Best Val loss obtained
                 if self.config.to_save_checkpoint and val_loss < self.best_val_loss:
                     self.save_checkpoint(filename='best.pt') # best.pt saved
                     self.best_val_loss = val_loss
             elif self.step % self.config.log_interval == 0:
-                print(f"Step: {self.step}, Loss: {train_loss:.4f}")
+                print(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}")
 
             # Checkpointing
             if self.config.to_save_checkpoint and self.step % self.config.checkpoint_interval == 0:
@@ -236,12 +315,47 @@ class LLMTrainer:
 
         # Final Logging
         val_loss = self.evaluate_model()
-        print(f"Step: {self.step}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
+        self.val_loss_hist.append(val_loss)
+        print(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
         # Best Val loss obtained
         if self.config.to_save_checkpoint and val_loss < self.best_val_loss:
             self.save_checkpoint(filename='best.pt') # best.pt saved
             self.best_val_loss = val_loss
+
         
+    def save_checkpoint(self, filename:str='latest.pt') -> None:
+
+        ckpt_path = Path(self.config.checkpoint_dir)
+        ckpt_path.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_path/filename
+
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "model_config": self.model.config,
+            "train_config": self.config,
+            "step": self.step,                             # Num of update steps while training
+            "train_loss_hist": self.train_loss_hist,       # Train loss dumped for every step 
+            "val_loss_hist": self.val_loss_hist,           # Val loss dumped for every step 
+            "train_loader_state": {
+                "curr_idx": self.train_loader.curr_idx,    # Store the curr_idx of train_loader - so that we resume form the same batch
+            },
+            "rng_state": torch.get_rng_state(),            # While loading: torch.set_rng_state(checkpoint["rng_state"])
+        }
+
+        torch.save(checkpoint, ckpt_path)
+        print(f"Checkpoint saved: {ckpt_path}")
+        
+
+    def load_checkpoint(self, file_path:str, weights_only:bool=False) -> Any:
+        file_path = Path(file_path)
+        if file_path.exists():
+            return torch.load(file_path, weights_only=weights_only)
+        else:
+            raise FileNotFoundError(
+                f"File not found at path {str(file_path)}"
+            )
+
 
 
 if __name__=='__main__':
@@ -258,7 +372,7 @@ if __name__=='__main__':
     llm_config = LLMConfig(
         vocab_size=50257,
         ctx_len=128,
-        d_model=384, 
+        d_model=256, 
         n_layer=4,
         ff_ratio=4,
         dropout=0.0,
@@ -280,8 +394,15 @@ if __name__=='__main__':
     # ======== DEFINE Trainer Config ========
     trainer_config = LLMTrainerConfig(
         num_steps=100,
-        batch_size=4,
+        batch_size=8,
         learning_rate=3e-4,
+        weight_decay=0.01,
+        beta1=0.9,
+        beta2=0.95,
+        use_lr_scheduler=True,
+        warmup_steps=15,
+        min_lr=0.1*3e-4,
+        grad_clip=1.0,
         log_interval=5,
         eval_interval=50,
         eval_steps=32,
@@ -289,7 +410,7 @@ if __name__=='__main__':
         checkpoint_interval=50,
         device='auto'
     )
-    print(llm_config)
+    print(trainer_config)
     print('-'*50)
 
     # ======== Instantiate Train Batch Loaders ========

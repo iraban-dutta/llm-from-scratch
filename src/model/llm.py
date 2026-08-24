@@ -5,6 +5,7 @@ from .llm_config import LLMConfig
 from .position_embedding import build_position_embedding
 from .layers import Decoder
 from .normalization import LayerNorm
+from src.inference.kv_cache import KVCacheManager
 
 class LLM(nn.Module):
     def __init__(self, config:LLMConfig):
@@ -21,10 +22,52 @@ class LLM(nn.Module):
         }
         
         self.transformer = nn.ModuleDict(model_dict)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, config.bias)
+
+        # Weight Tying
+        self.transformer.wte.weight = self.lm_head.weight
+        assert self.transformer.wte.weight.data_ptr() == self.lm_head.weight.data_ptr(), (
+            f"Issue in Weight Tying"
+        )
+        print('Weight Tying Done: B/W initial Embedding Layer and final Linear Layer before Softmax!')
+
+        # Manual init
+        self.apply(self._init_weights)
+
+        # Report #params for model
+        print(f"Model initialized, number of parameters: {(self._get_num_params()/1e6):.2f}M")
+
+    def _init_weights(self, module):
+
+        std = 0.02
+        if isinstance(module, nn.Linear) and hasattr(module, 'RESIDUAL_PATH_SCALE_INIT'):
+            std = 1/((2*self.config.n_layer)**0.5)
+            torch.nn.init.normal_(tensor=module.weight, mean=0.0, std=std)
+        
+        # For nn.Linear.weight: keep init scaling - default
+        # For nn.Linear.bias  : keep init scaling - as zero
+        if isinstance(module, nn.Linear):
+            # torch.nn.init.normal_(tensor=module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(tensor=module.bias)
+
+        # For nn.Embedding.weight: keep init scaling - default
+        # if isinstance(module, nn.Embedding):
+        #     torch.nn.init.normal_(tensor=module.weight, mean=0.0, std=std)
 
 
-    def forward(self, x:torch.Tensor, y:None|torch.Tensor=None) -> torch.Tensor:
+
+    def _get_num_params(self, non_embedding:bool=True) -> float:
+
+        # Get total count of model params - include/exclude positional embedding params (only for LearnedPostionalEmbedding)
+        total_params = sum(p.nelement() for p in self.parameters())
+        pos_emb_params = sum(p.nelement() for p in self.transformer.wpe.parameters())
+        if pos_emb_params>0 and non_embedding:
+            total_params -= pos_emb_params
+        return total_params
+
+
+    def forward(self, x:torch.Tensor, y:None|torch.Tensor=None, kv_cache_manager:KVCacheManager|None=None) -> torch.Tensor:
 
         # x.shape = (B, T)
         B, T = x.shape
@@ -39,13 +82,42 @@ class LLM(nn.Module):
                 f"Sequence length in x={T} should be lesser than max context length of model {self.config.ctx_len}"
         )
 
-        # Forward Pass
+        use_kv_cache = kv_cache_manager is not None
+
+        # Forward Pass1: Token Embeddings
         x = self.transformer.wte(x)
-        x = self.transformer.wpe(x)
+
+        # Forward Pass2: Absolute Positional Embeddings (If RoPE: Bypassed with nn.Identity)
+        if use_kv_cache:
+            # Get the current token idx (During Inference: Prefill or Decode)
+            curr_token_idx = kv_cache_manager[0].curr_idx
+
+            # In Prefill: We ensure x is of shape (B, T, d_model) and T is always upper bounded to ctx_len
+            # In Decode : We get x of shape (B, 1, d_model) -> Once ctx_len is full, we slide the context over the latest tokens in window ctx_len
+            # In Decode : Once the ctx_len is full, we always eject the oldest token from KV Cache and append the current token to the last position of cache
+            curr_token_idx = min(curr_token_idx, self.config.ctx_len-1)
+
+            # Get PEs (Adjusts for the psition of )
+            x = self.transformer.wpe(x, position_offset=curr_token_idx)
+        else:
+            # Normal Path: Without KV Cache
+            x = self.transformer.wpe(x, position_offset=0)
+
+        # Forward Pass3: Dropout
         x = self.transformer.drp(x)
-        for decoder in self.transformer.dec:
-            x=decoder(x)
+
+        # Forward Pass4: Sequence of Decoder Layers (Norm + Attention + Norm + MLP)
+        for i, decoder in enumerate(self.transformer.dec):
+            kv_cache = None
+            if use_kv_cache:
+                kv_cache = kv_cache_manager[i]
+            x=decoder(x, kv_cache)
+
+
+        # Forward Pass5: Norm (Before LM Head)
         x = self.transformer.ln_final(x)
+
+        # Forward Pass6: LM head
         logits = self.lm_head(x)
 
         loss = None
@@ -95,13 +167,11 @@ if __name__=='__main__':
     # Instantiate model
     model = LLM(config)
     model = model.to(device)
-    print(f"Model instantiated and moved to {device}")
+    print(f"Model moved to {device}")
     print('-'*50)
     
     # Total params
-    total_params = sum(p.nelement() for p in model.parameters())
-    print(f'Total parameters:\n {(total_params/1e6):.2f}M')
-    print('-'*50)
+    total_params = model._get_num_params()
 
     # Param contribution
     print(f"{'Param':45s} {'Shape':15s} {'Contribution':10s}")
@@ -113,6 +183,9 @@ if __name__=='__main__':
     # print(model.transformer)
     # print(model.transformer.wte)
     # print(model.transformer.dec)
+
+    # # Debug Breakpoint
+    # breakpoint()
 
     # Dummy Forward pass of a mini batch
     g=torch.Generator(device=device).manual_seed(42)
