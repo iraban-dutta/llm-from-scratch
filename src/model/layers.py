@@ -3,7 +3,7 @@ import torch.nn as nn
 from .llm_config import LLMConfig
 from .attention import build_attention
 from .normalization import LayerNorm
-from src.inference.kv_cache import KVCache
+from src.inference.cache import KVCache, MHLACache
 
 
 class MLP(nn.Module):
@@ -33,14 +33,11 @@ class Decoder(nn.Module):
         # MLP Block
         self.mlp=MLP(config)
         
-
-
-
-    def forward(self, x:torch.Tensor, kv_cache:KVCache|None=None) -> torch.Tensor:
+    def forward(self, x:torch.Tensor, cache:KVCache|MHLACache|None=None) -> torch.Tensor:
         # x.shape = (B, T, d_model)
 
         # PreNorm Architecture with a clean residual stream
-        x = x + self.attn(self.ln_attn(x), kv_cache)
+        x = x + self.attn(self.ln_attn(x), cache)
         x = x + self.mlp(self.ln_mlp(x))
 
         return x

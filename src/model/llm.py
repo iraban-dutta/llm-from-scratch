@@ -5,7 +5,7 @@ from .llm_config import LLMConfig
 from .position_embedding import build_position_embedding
 from .layers import Decoder
 from .normalization import LayerNorm
-from src.inference.kv_cache import KVCacheManager
+from src.inference.cache import KVCacheManager, MHLACacheManager
 
 class LLM(nn.Module):
     def __init__(self, config:LLMConfig):
@@ -67,7 +67,7 @@ class LLM(nn.Module):
         return total_params
 
 
-    def forward(self, x:torch.Tensor, y:None|torch.Tensor=None, kv_cache_manager:KVCacheManager|None=None) -> torch.Tensor:
+    def forward(self, x:torch.Tensor, y:None|torch.Tensor=None, cache_manager:KVCacheManager|MHLACacheManager|None=None) -> torch.Tensor:
 
         # x.shape = (B, T)
         B, T = x.shape
@@ -82,22 +82,22 @@ class LLM(nn.Module):
                 f"Sequence length in x={T} should be lesser than max context length of model {self.config.ctx_len}"
         )
 
-        use_kv_cache = kv_cache_manager is not None
+        use_cache = cache_manager is not None
 
         # Forward Pass1: Token Embeddings
         x = self.transformer.wte(x)
 
         # Forward Pass2: Absolute Positional Embeddings (If RoPE: Bypassed with nn.Identity)
-        if use_kv_cache:
+        if use_cache:
             # Get the current token idx (During Inference: Prefill or Decode)
-            curr_token_idx = kv_cache_manager[0].curr_idx
+            curr_token_idx = cache_manager[0].curr_idx
 
             # In Prefill: We ensure x is of shape (B, T, d_model) and T is always upper bounded to ctx_len
             # In Decode : We get x of shape (B, 1, d_model) -> Once ctx_len is full, we slide the context over the latest tokens in window ctx_len
             # In Decode : Once the ctx_len is full, we always eject the oldest token from KV Cache and append the current token to the last position of cache
             curr_token_idx = min(curr_token_idx, self.config.ctx_len-1)
 
-            # Get PEs (Adjusts for the psition of )
+            # Get PEs (Adjusts for the position of current token in the sequence being decoded)
             x = self.transformer.wpe(x, position_offset=curr_token_idx)
         else:
             # Normal Path: Without KV Cache
@@ -108,10 +108,10 @@ class LLM(nn.Module):
 
         # Forward Pass4: Sequence of Decoder Layers (Norm + Attention + Norm + MLP)
         for i, decoder in enumerate(self.transformer.dec):
-            kv_cache = None
-            if use_kv_cache:
-                kv_cache = kv_cache_manager[i]
-            x=decoder(x, kv_cache)
+            cache = None
+            if use_cache:
+                cache = cache_manager[i]
+            x=decoder(x, cache)
 
 
         # Forward Pass5: Norm (Before LM Head)

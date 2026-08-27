@@ -3,7 +3,7 @@ import numpy as np
 from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
-from .kv_cache import KVCacheManager
+from .cache import KVCacheManager, MHLACacheManager
 from src.model.llm_config import LLMConfig
 from src.model.llm import LLM
 from config.test import SAMPLING_STRATEGIES, TOKENIZERS_SUPPORTED
@@ -140,15 +140,26 @@ class TextGenerator:
         # Define sampler
         self.sampler = Sampler(config.strategy, config.temperature, config.top_k)
 
-
-        # Define KV Cache Manager
-        self.kv_cache_manager = KVCacheManager(
-            head_dim=(self.model.config.d_model//self.model.config.n_heads),
-            n_kv=get_n_kv_heads(self.model.config),
-            max_new_tokens=self.max_new_tokens,
-            ctx_len=self.model.config.ctx_len,
-            n_layer=self.model.config.n_layer
-        )
+        # Cache Manager
+        if self.model.config.attention=='mhla':
+            # MHLA Cache Manager: Works with MHLA
+            self.cache_manager = MHLACacheManager(
+                d_latent=self.model.config.d_latent1,
+                d_headR=self.model.config.d_headR,
+                max_new_tokens=self.max_new_tokens,
+                ctx_len=self.model.config.ctx_len,
+                is_rope=self.model.config.rotary_embedding,
+                n_layer=self.model.config.n_layer
+            )
+        elif self.model.config.attention in ('mha', 'gqa'):
+            # KV Cache Manager: Works with MHA and GQA
+            self.cache_manager = KVCacheManager(
+                head_dim=(self.model.config.d_model//self.model.config.n_heads),
+                n_kv=get_n_kv_heads(self.model.config),
+                max_new_tokens=self.max_new_tokens,
+                ctx_len=self.model.config.ctx_len,
+                n_layer=self.model.config.n_layer
+            )
 
 
     def _encode_prompt(self, prompt:str) -> torch.Tensor:
@@ -205,7 +216,8 @@ class TextGenerator:
 
             # ======== Prefill ========
             # Model Forward pass: Shape = (num_samples, T, vocab_size)
-            logits, _ = self.model(x=x_tokens, kv_cache_manager=self.kv_cache_manager)
+            logits, _ = self.model(x=x_tokens, cache_manager=self.cache_manager)
+            # print(self.cache_manager[0].ntokens_processed)
 
             # Next token: Shape = (num_samples, 1)
             next_token = self.sampler.sample_next_token(logits, generator)
@@ -217,7 +229,8 @@ class TextGenerator:
             for i in range(self.max_new_tokens-1):
 
                 # Model Forward pass: Shape = (num_samples, 1, vocab_size)
-                logits, _ = self.model(x=next_token, kv_cache_manager=self.kv_cache_manager)
+                logits, _ = self.model(x=next_token, cache_manager=self.cache_manager)
+                # print(self.cache_manager[0].ntokens_processed)
 
                 # Next token: Shape = (num_samples, 1)
                 next_token = self.sampler.sample_next_token(logits, generator)
@@ -226,7 +239,7 @@ class TextGenerator:
                 x_tokens = torch.cat([x_tokens, next_token], dim=-1)
 
         # Reset Cache
-        self.kv_cache_manager.reset()
+        self.cache_manager.reset()
 
         # De-Tokenize
         out = list(map(lambda x: self._decode_tokens(x.tolist()), x_tokens))
@@ -248,12 +261,15 @@ if __name__=='__main__':
         eps=1e-5,
         bias=False,
         position_embedding='sinusoidal',
-        rotary_embedding=False,
-        attention='gqa',
+        rotary_embedding=True,
+        attention='mhla',
         normalization='layernorm',
         n_heads=8, 
-        n_groups=4,
-        use_flash=True, 
+        # n_groups=4,
+        d_latent1=(512//8)*2,
+        d_latent2=(512//8)*2,
+        d_headR=(512//8)//2,
+        use_flash=False, 
         attn_debug=False
     )
     print(llm_config)
@@ -277,16 +293,16 @@ if __name__=='__main__':
     print(f"Model instantiated and moved to {device}")
     print('-'*50)
 
-    # CKPT
-    ckpt_path = '/Users/irabandutta/Developer/2026-08-llm-from-scratch/checkpoints/2026_08_23_03_48_39/best.pt'
-    ckpt = torch.load(ckpt_path, weights_only=False)
-    print('Checkpoint Loaded')
-    model.load_state_dict(ckpt['model_state_dict'])
+    # # CKPT
+    # ckpt_path = '/Users/irabandutta/Developer/2026-08-llm-from-scratch/checkpoints/2026_08_23_03_48_39/best.pt'
+    # ckpt = torch.load(ckpt_path, weights_only=False)
+    # print('Checkpoint Loaded')
+    # model.load_state_dict(ckpt['model_state_dict'])
 
 
     # ======== DEFINE Generator ========
     SAMPLES = 5
-    MAX_NEW_TOKENS = 150
+    MAX_NEW_TOKENS = 50
 
     text_gen_config = TextGeneratorConfig(
         model=model,
@@ -312,10 +328,10 @@ if __name__=='__main__':
     # logits_naive, _ = model(x)
 
     # # KV prefill
-    # text_generator.kv_cache_manager.reset()
+    # text_generator.cache_manager.reset()
     # logits_prefill, _ = model(
     #     x,
-    #     kv_cache_manager=text_generator.kv_cache_manager
+    #     cache_manager=text_generator.cache_manager
     # )
 
     # print(
@@ -333,7 +349,7 @@ if __name__=='__main__':
     # # Cached decode
     # logits_cached_2, _ = model(
     #     next_token,
-    #     kv_cache_manager=text_generator.kv_cache_manager
+    #     cache_manager=text_generator.cache_manager
     # )
 
     # print(
@@ -345,7 +361,7 @@ if __name__=='__main__':
     # # ================================
 
 
-    # ======== Generation with KV Cache ========
+    # ======== Generation with Cache ========
     # Prompt
     prompt = "Hey, hi"
     g = torch.Generator(device=device).manual_seed(42)
@@ -369,39 +385,39 @@ if __name__=='__main__':
         print('-'*50)
 
 
-    # # ======== NAIVE Generation ========
-    # # Prompt
-    # prompt = "Hey, hi"
-    # g = torch.Generator(device=device).manual_seed(42)
-    # tokens_per_sec_hist_naive = []
-    # start_time_naive = time.perf_counter()
+    # ======== NAIVE Generation ========
+    # Prompt
+    prompt = "Hey, hi"
+    g = torch.Generator(device=device).manual_seed(42)
+    tokens_per_sec_hist_naive = []
+    start_time_naive = time.perf_counter()
 
-    # # Generate: Call method to run Prefill + Decode
-    # out = text_generator.generate_naive(prompt, generator=g)
+    # Generate: Call method to run Prefill + Decode
+    out = text_generator.generate_naive(prompt, generator=g)
 
-    # # Synchronize
-    # if device.type == 'mps':
-    #     torch.mps.synchronize()
+    # Synchronize
+    if device.type == 'mps':
+        torch.mps.synchronize()
 
-    # end_time_naive = time.perf_counter()
+    end_time_naive = time.perf_counter()
 
-    # print("================================")
-    # print("GENERATED SAMPLES: NAIVE")
-    # print("================================")
-    # for sample in out:
-    #     print(sample)
-    #     print('-'*50)
+    print("================================")
+    print("GENERATED SAMPLES: NAIVE")
+    print("================================")
+    for sample in out:
+        print(sample)
+        print('-'*50)
 
-    # # Generation Time
-    # gen_t = end_time - start_time
-    # gen_t_naive = end_time_naive - start_time_naive
+    # Generation Time
+    gen_t = end_time - start_time
+    gen_t_naive = end_time_naive - start_time_naive
 
-    # # Throughput
-    # tokens_per_sec_hist.append((SAMPLES*MAX_NEW_TOKENS)/gen_t)
-    # tokens_per_sec_hist_naive.append((SAMPLES*MAX_NEW_TOKENS)/gen_t_naive)
-    # print(f'Finished Benchmark:KV, Total Time: {gen_t:.2f} ms for {SAMPLES*MAX_NEW_TOKENS} tokens, Mean(Tokens/Sec): {np.mean(tokens_per_sec_hist):.2f}')
-    # print(f'Finished Benchmark:Naive, Total Time: {gen_t_naive:.2f} ms for {SAMPLES*MAX_NEW_TOKENS} tokens, Mean(Tokens/Sec): {np.mean(tokens_per_sec_hist_naive):.2f}')
-    # print('-'*50)
+    # Throughput
+    tokens_per_sec_hist.append((SAMPLES*MAX_NEW_TOKENS)/gen_t)
+    tokens_per_sec_hist_naive.append((SAMPLES*MAX_NEW_TOKENS)/gen_t_naive)
+    print(f'Finished Benchmark:With Cache, Total Time: {gen_t:.2f} ms for {SAMPLES*MAX_NEW_TOKENS} tokens, Mean(Tokens/Sec): {np.mean(tokens_per_sec_hist):.2f}')
+    print(f'Finished Benchmark:Naive, Total Time: {gen_t_naive:.2f} ms for {SAMPLES*MAX_NEW_TOKENS} tokens, Mean(Tokens/Sec): {np.mean(tokens_per_sec_hist_naive):.2f}')
+    print('-'*50)
 
 
 
