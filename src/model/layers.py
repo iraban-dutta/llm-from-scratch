@@ -3,22 +3,8 @@ import torch.nn as nn
 from .llm_config import LLMConfig
 from .attention import build_attention
 from .normalization import LayerNorm
+from .moe import MLP, MoE
 from src.inference.cache import KVCache, MHLACache
-
-
-class MLP(nn.Module):
-    def __init__(self, config:LLMConfig):
-        super().__init__()
-        self.proj_in=nn.Linear(in_features=config.d_model, out_features=config.ff_ratio*config.d_model, bias=config.bias)
-        self.gelu=nn.GELU(approximate='tanh')
-        self.proj_out=nn.Linear(in_features=config.ff_ratio*config.d_model, out_features=config.d_model, bias=config.bias)
-        self.proj_out.RESIDUAL_PATH_SCALE_INIT=1
-
-    def forward(self, x:torch.Tensor) -> torch.Tensor:
-        x = self.proj_in(x)
-        x = self.gelu(x)
-        x = self.proj_out(x)
-        return x
 
 
 class Decoder(nn.Module):
@@ -31,7 +17,7 @@ class Decoder(nn.Module):
         # LayerNorm for MLP Block
         self.ln_mlp=LayerNorm(config)
         # MLP Block
-        self.mlp=MLP(config)
+        self.mlp=MLP(config) if not config.use_moe else MoE(config)
         
     def forward(self, x:torch.Tensor, cache:KVCache|MHLACache|None=None) -> torch.Tensor:
         # x.shape = (B, T, d_model)
@@ -46,20 +32,31 @@ class Decoder(nn.Module):
 
 if __name__=='__main__':
 
-    d_model=64
-    ff_ratio=4
-    dropout=0.0
-    n_heads=4
-    use_flash=False
-    attn_debug=False
+    d_model = 64
 
+    # # Decoder with MLP config
+    # config = LLMConfig(
+    #     d_model=d_model, 
+    #     ff_ratio=4,
+    #     dropout=0.0,
+    #     n_heads=4, 
+    #     use_flash=False, 
+    #     attn_debug=False,
+    #     use_moe=False
+    # )
+
+    # Decoder with MoE config
     config = LLMConfig(
         d_model=d_model, 
-        ff_ratio=ff_ratio,
-        dropout=dropout,
-        n_heads=n_heads, 
-        use_flash=use_flash, 
-        attn_debug=attn_debug
+        ff_ratio=4,
+        dropout=0.0,
+        n_heads=4, 
+        use_flash=False, 
+        attn_debug=False,
+        use_moe=True,
+        n_experts=3,
+        topk=2,
+        capcity_factor = 1.2
     )
 
     decoder = Decoder(config)

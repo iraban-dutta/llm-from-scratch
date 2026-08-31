@@ -122,7 +122,16 @@ class LLM(nn.Module):
 
         loss = None
         if y is not None:
+            # Language Modelling CCE Loss
             loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+            # MoE auxiliary losses
+            if self.config.use_moe:
+                aux_loss = 0.0
+                for decoder in self.transformer.dec:
+                    aux_loss += decoder.mlp.loss_coeff_var
+                    aux_loss += decoder.mlp.loss_load_balance
+
+                loss += aux_loss
 
         return logits, loss
 
@@ -148,7 +157,18 @@ if __name__=='__main__':
         n_heads=4, 
         n_groups=None,
         use_flash=False, 
-        attn_debug=False
+        attn_debug=False,
+        use_moe=True,
+        n_experts=3,
+        n_shared_experts=1,
+        topk=2,
+        capcity_factor = 1.2,
+        noisy_router=False,
+        router_noise_std=0.0,
+        scale_aux_loss_expert_imp=1.0,
+        scale_aux_loss_load_balance=1.0,
+        aux_loss_free_load_balance=False,
+        aux_loss_free_load_balance_bias_update=0.0
     )
     print(config)
     print('-'*50)
@@ -174,9 +194,9 @@ if __name__=='__main__':
     total_params = model._get_num_params()
 
     # Param contribution
-    print(f"{'Param':45s} {'Shape':15s} {'Contribution':10s}")
+    print(f"{'Param':50s} {'Shape':15s} {'Contribution':10s}")
     for k,v in model.state_dict().items():
-        print(f"{k:45s} {str(tuple(v.shape)):15s} {(100.0*v.nelement()/total_params):10.2f}%")
+        print(f"{k:50s} {str(tuple(v.shape)):15s} {(100.0*v.nelement()/total_params):10.2f}%")
     print('-'*50)
 
     # Access different layers of model
@@ -190,9 +210,12 @@ if __name__=='__main__':
     # Dummy Forward pass of a mini batch
     g=torch.Generator(device=device).manual_seed(42)
     x = torch.randint(low=0, high=50256, size=(16, ctx_len), generator=g, device=device)
+    y = torch.randint(low=0, high=50256, size=(16, ctx_len), generator=g, device=device)
     print(x.shape, x.device)
-    x, _ = model(x)
+    print(y.shape, y.device)
+    x, _ = model(x, y)
     print(x.shape, x.device)
+    print(y.shape, y.device)
     print('-'*50)
 
 

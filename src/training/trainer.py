@@ -81,16 +81,18 @@ class LLMTrainerConfig:
     grad_clip: float = 1.0
 
     # Logging
+    curr_datetime = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     log_interval: int = 10
+    log_dir: str = f"./logs/{curr_datetime}"
+    moe_log_interval: int = 100
 
     # Evaluation
-    eval_interval: int = 20
+    eval_interval: int = 100
     eval_steps: int    = 16*32 # (16X of train batch size)
 
     # Checkpointing
     to_save_checkpoint: bool = False
     checkpoint_interval: int = 500
-    curr_datetime = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     checkpoint_dir: str = f"./checkpoints/{curr_datetime}"
 
     # Device
@@ -126,6 +128,18 @@ class LLMTrainer:
         # Track Loss over steps
         self.train_loss_hist = []
         self.val_loss_hist   = []
+        # Initialize train.log file
+        log_path = Path(self.config.log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        self.log_file_path = log_path/'train.log'
+        # Initialize moe_stats.csv file
+        self.moe_stats_file_path = log_path/'moe_stats.csv'
+        if (self.model.config.use_moe) and not (self.moe_stats_file_path.exists()):
+            with open(self.moe_stats_file_path, "w") as f:
+                f.write(
+                    "step,layer,expert,token_distr,expert_imp,"
+                    "token_dropped,expert_bias\n"
+                )
 
 
     def _resolve_device(self) -> torch.device:
@@ -294,18 +308,24 @@ class LLMTrainer:
             train_throughput = (self.config.batch_size*self.model.config.ctx_len)/step_total_time
 
 
-            # Logging
+            # Logging: Log Train Stats @ eval_interval or @ log_iterval
             if self.step % self.config.eval_interval == 0:
                 val_loss = self.evaluate_model()
                 self.val_loss_hist.append(val_loss)
-                print(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
+                self._log(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
                 # Best Val loss obtained
                 if self.config.to_save_checkpoint and val_loss < self.best_val_loss:
                     self.save_checkpoint(filename='best.pt') # best.pt saved
                     self.best_val_loss = val_loss
             elif self.step % self.config.log_interval == 0:
-                print(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}")
+                # Track normal train stats @ every log_iterval
+                self._log(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}")
 
+            # MoE Logging: Log MoE Routing stats @ every moe_log_iterval
+            if (self.model.config.use_moe) and (self.step % self.config.moe_log_interval == 0):
+                self._log_moe_stats()
+                self._save_moe_stats()
+                   
             # Checkpointing
             if self.config.to_save_checkpoint and self.step % self.config.checkpoint_interval == 0:
                 self.save_checkpoint(filename='latest.pt') # latest.pt saved
@@ -313,14 +333,19 @@ class LLMTrainer:
             # Update step attribute    
             self.step += 1
 
-        # Final Logging
+        # Final Logging: Log Train Stats @ eval_interval or @ log_iterval
         val_loss = self.evaluate_model()
         self.val_loss_hist.append(val_loss)
-        print(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
+        self._log(f"Step: {self.step}, BatchTime: {step_total_time*1000:.2f} ms, TPUT: {train_throughput:.2f} tok/sec, LR: {lr:.6f}, GradNorm: {grad_norm:.2f}, Loss: {train_loss:.4f}, Val_Loss: {val_loss:.4f}")
         # Best Val loss obtained
         if self.config.to_save_checkpoint and val_loss < self.best_val_loss:
             self.save_checkpoint(filename='best.pt') # best.pt saved
             self.best_val_loss = val_loss
+
+        # Final MoE Logging: Log MoE Routing stats @ every moe_log_iterval
+        if self.model.config.use_moe:
+            self._log_moe_stats()
+            self._save_moe_stats()
 
         
     def save_checkpoint(self, filename:str='latest.pt') -> None:
@@ -357,6 +382,73 @@ class LLMTrainer:
             )
 
 
+    def _log(self, msg: str) -> None:
+        print(msg)
+        with open(self.log_file_path, "a") as f:
+            f.write(msg + "\n")
+
+
+    def _log_moe_stats(self) -> None:
+        self._log("MoE Routing Stats:")
+        for layer_idx, decoder in enumerate(self.model.transformer.dec):
+            moe = decoder.mlp
+
+            token_distr = moe.token_distr.detach().cpu().numpy()
+
+            # Use fewer summary statistics for small numbers of experts.
+            if self.model.config.n_experts <= 4:
+                token_dist_summary = (
+                    f"min={np.min(token_distr):.3f} "
+                    f"p50={np.percentile(token_distr, 50):.3f} "
+                    f"max={np.max(token_distr):.3f}"
+                )
+            else:
+                token_dist_summary = (
+                    f"min={np.min(token_distr):.3f} "
+                    f"p25={np.percentile(token_distr, 25):.3f} "
+                    f"p50={np.percentile(token_distr, 50):.3f} "
+                    f"p75={np.percentile(token_distr, 75):.3f} "
+                    f"max={np.max(token_distr):.3f}"
+                )
+
+
+            dropped_pct = 100.0 * (moe.token_dropped.sum().item() / (self.config.batch_size * self.model.config.ctx_len * self.model.config.topk))
+
+            self._log(
+                f"Layer: {layer_idx} | "
+                f"TokenDist: {token_dist_summary} | "
+                f"Dropped: {dropped_pct:.2f}%"
+            )
+
+    def _save_moe_stats(self) -> None:
+        rows = []
+
+        for layer_idx, decoder in enumerate(self.model.transformer.dec):
+            moe = decoder.mlp
+
+            token_distr = moe.token_distr.detach().cpu().numpy()
+            expert_imp = moe.expert_imp.detach().cpu().numpy()
+            token_dropped = moe.token_dropped.detach().cpu().numpy()
+
+            if self.model.config.aux_loss_free_load_balance:
+                expert_bias = moe.expert_bias.detach().cpu().numpy()
+            else:
+                expert_bias = [None] * self.model.config.n_experts
+
+            for expert_idx in range(self.model.config.n_experts):
+                rows.append(
+                    f"{self.step},{layer_idx},{expert_idx},"
+                    f"{token_distr[expert_idx]},"
+                    f"{expert_imp[expert_idx]},"
+                    f"{token_dropped[expert_idx]},"
+                    f"{expert_bias[expert_idx]}\n"
+                )
+
+        with self.moe_stats_file_path.open("a") as f:
+            f.writelines(rows)
+        
+
+
 
 if __name__=='__main__':
 
@@ -371,9 +463,9 @@ if __name__=='__main__':
     # ======== DEFINE Model Config ========
     llm_config = LLMConfig(
         vocab_size=50257,
-        ctx_len=128,
-        d_model=256, 
-        n_layer=4,
+        ctx_len=32,
+        d_model=64, 
+        n_layer=2,
         ff_ratio=4,
         dropout=0.0,
         eps=1e-5,
@@ -385,7 +477,18 @@ if __name__=='__main__':
         n_heads=4, 
         n_groups=None,
         use_flash=False, 
-        attn_debug=False
+        attn_debug=False,
+        use_moe=False,
+        n_experts=4,
+        n_shared_experts=0,
+        topk=2,
+        capcity_factor = 1.25,
+        noisy_router=False,
+        router_noise_std=0.0,
+        scale_aux_loss_expert_imp=0.0,
+        scale_aux_loss_load_balance=0.0,
+        aux_loss_free_load_balance=True,
+        aux_loss_free_load_balance_bias_update=0.001
     )
     print(llm_config)
     print('-'*50)
@@ -393,17 +496,18 @@ if __name__=='__main__':
 
     # ======== DEFINE Trainer Config ========
     trainer_config = LLMTrainerConfig(
-        num_steps=100,
+        num_steps=500,
         batch_size=8,
-        learning_rate=3e-4,
+        learning_rate=6e-4,
         weight_decay=0.01,
         beta1=0.9,
         beta2=0.95,
         use_lr_scheduler=True,
         warmup_steps=15,
-        min_lr=0.1*3e-4,
+        min_lr=0.1*6e-4,
         grad_clip=1.0,
         log_interval=5,
+        moe_log_interval=50,
         eval_interval=50,
         eval_steps=32,
         to_save_checkpoint=False,

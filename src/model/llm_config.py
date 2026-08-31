@@ -23,6 +23,7 @@ class LLMConfig:
     rotary_embedding: bool = False
     attention: str = "mha"
     normalization: str = "layernorm"
+    use_moe: bool = False
 
     # ================================================================
     # Attention - Common
@@ -42,6 +43,37 @@ class LLMConfig:
     d_latent1: int | None = None
     d_latent2: int | None = None
     d_headR: int | None = None
+
+
+    # ================================================================
+    # MoE
+    # ================================================================
+
+    # ------------------------------------------------
+    # Routing
+    # ------------------------------------------------
+    n_experts: int = 2
+    topk: int = 1
+    capcity_factor: float = 1.0
+
+    # Noisy Router
+    noisy_router: bool = False
+    router_noise_std: float = 0.0
+
+    # ------------------------------------------------
+    # Experts
+    # ------------------------------------------------
+    n_shared_experts: int = 0
+
+    # ------------------------------------------------
+    # Auxiliary Losses
+    # ------------------------------------------------
+    scale_aux_loss_expert_imp: float = 0.0
+    scale_aux_loss_load_balance: float = 0.0
+    aux_loss_free_load_balance: bool = False
+    aux_loss_free_load_balance_bias_update: float = 0.0
+
+
 
     # ================================================================
     # Validation
@@ -120,6 +152,7 @@ class LLMConfig:
                 f"Expected one of {valid_norm}"
             )
 
+
         # ============================================================
         # Attention - Common
         # ============================================================
@@ -150,6 +183,13 @@ class LLMConfig:
 
             case "mhla":
                 self._validate_mhla()
+
+
+        # ============================================================
+        # MoE
+        # ============================================================
+        self._validate_moe()
+
 
     def _validate_gqa(self) -> None:
 
@@ -205,3 +245,82 @@ class LLMConfig:
                 raise ValueError(
                     "d_headR must be > 0."
                 )
+
+
+    def _validate_moe(self) -> None:
+
+        # ============================================================
+        # MoE
+        # ============================================================
+        if not self.use_moe:
+            return
+
+        # ------------------------------------------------------------
+        # Routing
+        # ------------------------------------------------------------
+        if self.n_experts <= 1:
+            raise ValueError(
+                "MoE requires n_experts > 1."
+            )
+
+        if self.topk <= 0:
+            raise ValueError(
+                "MoE topk must be > 0."
+            )
+
+        if self.topk > self.n_experts:
+            raise ValueError(
+                f"MoE topk ({self.topk}) cannot be greater than "
+                f"n_experts ({self.n_experts})."
+            )
+
+        if self.capcity_factor <= 0:
+            raise ValueError(
+                "MoE capcity_factor must be > 0."
+            )
+
+        # ------------------------------------------------------------
+        # Noisy Router
+        # ------------------------------------------------------------
+        if self.noisy_router and self.router_noise_std <= 0:
+            raise ValueError(
+                "router_noise_std must be > 0 when noisy_router=True."
+            )
+
+        # ------------------------------------------------------------
+        # Auxiliary Losses
+        # ------------------------------------------------------------
+        if self.scale_aux_loss_expert_imp < 0:
+            raise ValueError(
+                "scale_aux_loss_expert_imp must be >= 0."
+            )
+
+        if self.scale_aux_loss_load_balance < 0:
+            raise ValueError(
+                "scale_aux_loss_load_balance must be >= 0."
+            )
+
+        if self.aux_loss_free_load_balance_bias_update < 0:
+            raise ValueError(
+                "aux_loss_free_load_balance_bias_update must be >= 0."
+            )
+
+        # DeepSeek-style auxiliary-loss-free load balancing
+        # is an alternative to the explicit load-balance loss.
+        if (
+            self.aux_loss_free_load_balance
+            and self.scale_aux_loss_load_balance > 0
+        ):
+            raise ValueError(
+                "aux_loss_free_load_balance=True cannot be used "
+                "with scale_aux_loss_load_balance > 0."
+            )
+
+
+        # ------------------------------------------------------------
+        # Expert Configuration
+        # ------------------------------------------------------------
+        if self.n_shared_experts < 0:
+            raise ValueError(
+                "n_shared_experts must be >= 0."
+            )
