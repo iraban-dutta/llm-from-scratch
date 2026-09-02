@@ -56,7 +56,8 @@ if __name__=='__main__':
         use_moe=True,
         n_experts=3,
         topk=2,
-        capcity_factor = 1.2
+        capacity_factor = 1.2,
+        use_vectorized_dispatch=True,
     )
 
     decoder = Decoder(config)

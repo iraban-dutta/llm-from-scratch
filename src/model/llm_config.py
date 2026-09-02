@@ -54,7 +54,8 @@ class LLMConfig:
     # ------------------------------------------------
     n_experts: int = 2
     topk: int = 1
-    capcity_factor: float = 1.0
+    capacity_factor: float = 1.0
+    use_vectorized_dispatch: bool = True
 
     # Noisy Router
     noisy_router: bool = False
@@ -274,9 +275,9 @@ class LLMConfig:
                 f"n_experts ({self.n_experts})."
             )
 
-        if self.capcity_factor <= 0:
+        if self.capacity_factor <= 0:
             raise ValueError(
-                "MoE capcity_factor must be > 0."
+                "MoE capacity_factor must be > 0."
             )
 
         # ------------------------------------------------------------
