@@ -5,7 +5,7 @@ from src.training.trainer import LLMTrainerConfig
 
 # ======== SET Global Configs ========
 SEED = 42
-B = 16
+B = 8
 STEPS = 20000
 DEVICE = 'auto'
 

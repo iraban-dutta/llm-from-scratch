@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from .cache import KVCacheManager, MHLACacheManager
 from src.model.llm_config import LLMConfig
 from src.model.llm import LLM
-from config.test import SAMPLING_STRATEGIES, TOKENIZERS_SUPPORTED
+from config.constants import SAMPLING_STRATEGIES, TOKENIZERS_SUPPORTED
 
 
 def get_n_kv_heads(config):

@@ -11,8 +11,17 @@ from main.run_utils import make_loaders
 # ==============================================================================
 # Benchmark-only settings (not part of the long training config)
 # ==============================================================================
-WARMUP_STEPS = 10
+WARMUP_STEPS = 50
 BENCHMARK_STEPS = 100
+
+# ==============================================================================
+# Sync device
+# ==============================================================================
+def sync_device(device: torch.device) -> None:
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    elif device.type == 'mps':
+        torch.mps.synchronize()
 
 
 # ==============================================================================
@@ -83,8 +92,9 @@ for i in range(WARMUP_STEPS):
     print(f'Running WARMUP step: {i + 1}')
     _, _ = trainer.train_step()
 
-if trainer.device.type == 'mps':
-    torch.mps.synchronize()
+# Synchronize device
+sync_device(trainer.device)
+
 print('Finished Warmup')
 print('-' * 50)
 
@@ -97,14 +107,17 @@ print('-' * 50)
 tokens_per_sec_hist = []
 
 for i in range(BENCHMARK_STEPS):
+
+    # Synchronize device
+    sync_device(trainer.device)
     start = time.perf_counter()
 
     train_loss, grad_norm = trainer.train_step()
 
-    if trainer.device.type == 'mps':
-        torch.mps.synchronize()
-
+    # Synchronize device
+    sync_device(trainer.device)
     end = time.perf_counter()
+    
     bt = end - start
     tokens_per_sec = (B * T) / bt
     tokens_per_sec_hist.append(tokens_per_sec)

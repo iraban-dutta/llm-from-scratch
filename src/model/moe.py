@@ -385,6 +385,8 @@ class MoE(nn.Module):
             torch.cuda.synchronize()
         elif t.device.type == 'mps':
             torch.mps.synchronize()
+    
+    
     def forward_benchmark(self, x: torch.Tensor) -> torch.Tensor:
         """Same compute graph as forward(), with per-phase timing for benchmarking."""
         bench = {
