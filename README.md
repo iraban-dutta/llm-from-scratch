@@ -203,137 +203,132 @@ python -m main.tune_moe_routing \
 
 ## Configs
 
-Default run configs live in `config/`. Pass them as a Python module path to `--config`:
+### Default configs
 
-| File | Module | What it is |
-|------|--------|------------|
-| `config/dense_default.py` | `config.dense_default` | Dense TinyStories run |
-| `config/moe_default.py` | `config.moe_default` | Same backbone, `use_moe=True` |
-| `config/constants.py` | — | Vocab size, data paths, tokenizer / sampling enums |
+Two reference configurations are provided:
 
-Each file defines an `LLMConfig` (architecture) and an `LLMTrainerConfig` (optimizer, schedule, logging, checkpoints). CLI flags on `main.train` override the **trainer** only (batch size, LR, log/eval/ckpt intervals). Model shape always comes from the config module, or from the checkpoint on `--resume`.
+| Configuration | Description |
+|---|---|
+| dense_default.py | Dense decoder-only Transformer, as shown in the figure below |
+| moe_default.py | Same architecture with a sparse MoE layer in the FFN block |
 
-Both defaults share this backbone. The only FFN difference is dense MLP vs 4-expert MoE.
+![Decoder-only Transformer](docs/figures/transformer_dense.png)
 
-![Decoder-only model](docs/figures/transformer_dense.png)
+### Supported Model knobs
 
-*Left: full Transformer. Right: one pre-norm decoder block. Default TinyStories run uses GQA + RoPE + dense MLP (or MoE in `config.moe_default`).*
+The following options can be combined to build different Transformer architectures:
 
-| Choice | Dense (`config.dense_default`) | Sparse (`config.moe_default`) |
-|--------|-------------------------------|-------------------------------|
-| Vocab | 50304 (GPT-2 BPE, padded to a multiple of 128) | same |
-| Context `T` | 128 | same |
-| `d_model` | 512 | same |
-| Layers | 8 | same |
-| Attention | GQA, 8 query heads, 4 KV groups | same |
-| Head dim | 64 | same |
-| Position | RoPE | same |
-| FFN | Dense MLP, `ff_ratio=4` → `d_ff=2048`, GELU, no bias | MoE: 4 experts, top-1, CF=1.25 |
-| Load balancing | — | Aux-loss-free, γ = 0.05 |
-| Norm | LayerNorm, pre-norm | same |
-| Weight tying | Embedding tied to LM head | same |
-| Dropout / bias | 0 / False | same |
-| Parameters | ~50M (all active) | ~99M total, ~50M active (top-1) |
+| Component | Configuration | Options / Effect |
+|-----------|---------------|------------------|
+| **Model size** | d_model, n_layer, ctx_len | Controls model width, depth, and context length |
+| **FFN** | ff_ratio | FFN expansion relative to d_model |
+| **Attention** | attention | mha, gqa, or mhla |
+| **Attention heads** | n_heads | Number of query heads |
+| **KV groups** | n_groups | Number of KV groups; 1 gives MQA, n_heads gives MHA, and intermediate values give GQA |
+| **Position** | position_embedding | sinusoidal, learned, or identity |
+| **RoPE** | rotary_embedding | Enables Rotary Position Embeddings and overrides position_embedding with identity |
+| **MHLA** | d_latent1, d_latent2, d_headR | Latent dimensions and RoPE subspace used by MHLA |
+| **Normalization** | normalization | LayerNorm |
+| **Attention implementation** | use_flash | True → PyTorch SDPA kernels; False → explicit attention computation |
+| **MoE** | use_moe | False → dense MLP; True → sparse MoE |
+| **Experts** | n_experts, topk | Number of experts and experts selected per token |
+| **Capacity** | capacity_factor | Controls the maximum number of tokens assigned to each expert |
+| **Shared experts** | n_shared_experts | Number of experts that always process every token |
+| **Noisy routing** | noisy_router, router_noise_std | Adds Gaussian noise to router logits during training |
+| **Load balancing** | scale_aux_loss_expert_imp | Auxiliary loss for balancing expert importance |
+| **Load balancing** | scale_aux_loss_load_balance | Auxiliary loss for balancing expert load |
+| **Loss-free balancing** | aux_loss_free_load_balance | Enables auxiliary-loss-free balancing using dynamic expert biases |
+| **Bias update** | aux_loss_free_load_balance_bias_update | Controls the update rate of the expert biases |
+| **Dispatch** | use_vectorized_dispatch | Vectorized token dispatch vs a naive per-expert implementation |
 
-Weight tying shares one $V \times d_{\text{model}}$ matrix between the token embedding and the LM head. Pre-norm leaves the residual stream unnormalized, so the attention and FFN output projections are initialized with std $1/\sqrt{2L}$ ($L$ layers, two residual writes per block) to keep residual-stream variance from growing with depth.
+### Default values for Model knobs
 
-### Model knobs
+| | Dense | MoE |
+|---|---:|---:|
+| Vocabulary size | 50,304 | 50,304 |
+| Context length | 128 | 128 |
+| `d_model` | 512 | 512 |
+| Layers | 8 | 8 |
+| Attention | GQA | GQA |
+| Query heads | 8 | 8 |
+| KV groups | 4 | 4 |
+| Position | RoPE | RoPE |
+| Normalization | LayerNorm | LayerNorm |
+| FFN | Dense GELU MLP | 4 experts, top-1 |
+| Capacity factor | — | 1.25 |
+| Load balancing | — | Auxiliary-loss-free |
+| Expert bias update | — | 0.05 |
 
-Architecture is the dataclass `LLMConfig` in `src/model/llm_config.py`. Changing a field changes the block that gets built:
+### Supported Trainer knobs and default values
 
-| Field | Options / typical values | Architecture you get |
-|-------|--------------------------|----------------------|
-| `d_model`, `n_layer`, `ctx_len`, `ff_ratio` | e.g. 512, 8, 128, 4 | Width, depth, context, FFN expansion |
-| `attention` | `mha` | Multi-Head Attention: one KV head per query head |
-| `attention` | `gqa` | Grouped-Query Attention: `n_groups` KV heads shared across query heads |
-| `n_groups` | e.g. 4; `1`; `n_heads` | With GQA: 4 KV groups (default); **MQA** if `1`; MHA-equivalent if `n_groups = n_heads` |
-| `attention` | `mhla` | Multi-Head Latent Attention (DeepSeek-V2): KV/Q compressed through latents |
-| `d_latent1`, `d_latent2`, `d_headR` | MHLA only | Down-projected KV / Q latents, and the RoPE subspace dim |
-| `n_heads` | e.g. 8 | Query heads (`d_model` must divide evenly) |
-| `rotary_embedding` | `True` / `False` | RoPE on Q/K. Forces `position_embedding="identity"` |
-| `position_embedding` | `sinusoidal` · `learned` · `identity` | Absolute PE when RoPE is off |
-| `use_flash` | `True` / `False` | PyTorch SDPA kernels vs explicit $QK^{\top}$ attention |
-| `use_moe` | `False` | Dense GELU MLP in every decoder block |
-| `use_moe` | `True` | Sparse MoE layer instead of that MLP |
-| `n_experts`, `topk` | e.g. 4, 1 | Expert pool and how many experts fire per token |
-| `capacity_factor` | e.g. 1.25 | Per-expert token cap. Higher → fewer dropped tokens, more compute |
-| `n_shared_experts` | 0+ | DeepSeek-style experts that always run, in addition to routed ones |
-| `use_vectorized_dispatch` | `True` / `False` | Batched token routing vs legacy `torch.where` loop |
-| `noisy_router`, `router_noise_std` | Switch Transformer | Gaussian noise on router logits during training |
-| `scale_aux_loss_expert_imp` | `α_ei` | Importance (coefficient-of-variation) auxiliary loss |
-| `scale_aux_loss_load_balance` | `α_lb` | Load-balance auxiliary loss (cannot combine with loss-free) |
-| `aux_loss_free_load_balance` | `True` / `False` | DeepSeek bias buffer: updates routing, not the loss |
-| `aux_loss_free_load_balance_bias_update` | γ, e.g. 0.05 | How fast underloaded experts are boosted |
+Trainer settings can also be overridden from the command line without changing the model architecture.
 
-Invalid combinations fail in `LLMConfig.validate()` (GQA without `n_groups`, MHLA+RoPE without `d_headR`, loss-free + load-balance aux loss together, and so on).
-
-### Trainer knobs
-
-| Field | Default (TinyStories runs) | Role |
-|-------|----------------------------|------|
-| `num_steps` | 20000 | Optimizer steps |
-| `batch_size` | 8 | Tokens/step = `B * T` = 1024 |
-| `learning_rate` / `min_lr` | `6e-4` → `6e-5` | Peak LR and cosine floor |
-| `warmup_steps` | 15 | Linear warmup, then cosine |
-| `weight_decay`, `beta1`, `beta2` | 0.01, 0.9, 0.95 | AdamW; decay applied only to ≥2D tensors |
-| `grad_clip` | 1.0 | Global-norm clip |
-| `eval_interval` / `eval_steps` | 200 / 16 | Validation every N steps |
-| `checkpoint_interval` | 1000 | Writes `latest.pt`; `best.pt` on improved val loss |
-| `device` | `auto` | CUDA → MPS → CPU |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| num_steps | 20,000 | Number of optimizer steps |
+| batch_size | 8 | Sequences per batch |
+| learning_rate | 6e-4 | Peak learning rate |
+| min_lr | 6e-5 | Final learning rate after cosine decay |
+| warmup_steps | 15 | Linear warmup steps |
+| weight_decay | 0.01 | AdamW weight decay |
+| beta1, beta2 | 0.9, 0.95 | AdamW momentum parameters |
+| grad_clip | 1.0 | Maximum global gradient norm |
+| eval_interval | 200 | Steps between validation runs |
+| eval_steps | 16 | Validation batches per evaluation |
+| checkpoint_interval | 1,000 | Steps between checkpoints |
+| device | auto | CUDA → MPS → CPU |
 
 ---
 
-## Experiments and results
+## Experiments and Results
 
-Both long runs: `B=8`, `T=128`, 20k steps, **20.5M tokens** (`8 × 128 × 20,000`), seed 42, Apple M1 8GB (MPS). Loss starts near $\log V \approx 10.83$ at init.
+Both training runs use B=8, T=128, 20k steps, **20.5M tokens**, seed 42, and Apple M1 8GB (MPS). The initial loss is close to $\log V \approx 10.83$.
 
-### Dense
-
-`config.dense_default` — GQA, RoPE, one MLP per layer, ~50M parameters, all active.
+### Dense LLM on TinyStories (~50M parameters)
 
 | | Dense |
-|--|------:|
-| FFN | 1 MLP / layer |
+|---|---:|
+| FFN | Dense MLP |
 | Train loss @ 20k | 2.041 |
 | Val loss @ 20k | 2.044 |
-| **Best val loss** | **2.034** (step 19400) |
-| Train TPUT (steady) | ~2.0k tok/s |
+| **Best val loss** | **2.034** (step 19,400) |
+| Train TPUT | ~2.0k tok/s |
 
-Train and val fall together over the run; no split that would indicate overfitting on this budget.
+Train and validation loss decrease together throughout the run.
 
 ![Dense train vs val loss](docs/figures/dense_train_val.png)
 
-*Smoothed train and val loss over 20k steps. Best val 2.034.*
-
-A timed train-step sweep (warmup + device sync) was used to pick batch size before the long run. On this M1, peak tokens/s was at `B=16`; the 20k-step run used `B=8` as a stability / step-count tradeoff. Steady throughput after step 0 sat around 2k tok/s.
-
-### MoE on TinyStories
-
-`config.moe_default` — same backbone, 4 experts, top-1, CF=1.25, aux-loss-free load balancing with γ = 0.05 (chosen from a 200-step sweep). ~99M total parameters, ~50M active.
+### Sparse (MoE) LLM on TinyStories (~100M parameters)
 
 | | Sparse MoE |
-|--|------:|
+|---|---:|
 | FFN | 4 experts, top-1, CF=1.25 |
 | Train loss @ 20k | 2.141 |
 | Val loss @ 20k | 2.176 |
 | **Best val loss** | **2.160** |
-| Train TPUT (steady) | ~1.2k tok/s |
+| Train TPUT | ~1.2k tok/s |
 
-![Sparse train vs val loss](docs/figures/moe_train_val.png)
+![MoE train vs val loss](docs/figures/moe_train_val.png)
 
-*Smoothed train and val loss over 20k steps. Best val 2.160.*
+#### Token routing stats
 
-**Routing.** After the initial transient:
+Routing metrics are aggregated across all 8 decoder layers. After the initial transient:
 
-- Routing CV settles in **0.15–0.20**
-- Max load ratio settles around **1.2×** fair share
-- Token drop rate falls from ~17% at step 0 to **generally below 1%**
+| Metric | Description | Result |
+|---|---|---:|
+| **Routing CV** | Coefficient of variation of tokens routed to each expert; lower means more balanced routing | settles to 0.15–0.20 |
+| **Maximum load ratio** | Maximum expert load relative to its fair-share load; 1.0× is perfectly balanced | settles at ~1.2× |
+| **Token drop rate** | Fraction of tokens exceeding expert capacity | settles to <1% |
 
 ![MoE routing CV and max load](docs/figures/moe_routing.png)
 
-*Left: routing CV averaged over 8 layers. Right: max load / fair share. Dashed line is the ideal ratio of 1.0.*
+![MoE routing  drop rate](docs/figures/moe_routing_drop_rate.png)
 
-**Throughput: naive vs vectorized dispatch.** Apples-to-apples step benchmark (same `B=8`, `T=128`, 4 experts, top-1, **CF=4** so dropping is not the variable). 300 warmup steps, 200 timed steps, median, device synced.
+#### Naive vs vectorized dispatch
+
+An apples-to-apples training-step benchmark was run with B=8, T=128, 4 experts, top-1 routing, and **CF=4** to avoid token dropping as a confounding factor. Results use 300 warmup steps and 200 timed steps, with median timings and device synchronization.
+
+The benchmark identified **MoE dispatch as a primary training bottleneck**, motivating the implementation of a vectorized approach which improved the final TPUT.
 
 | Run | Median step | TPUT |
 |-----|------------:|-----:|
@@ -341,44 +336,28 @@ A timed train-step sweep (warmup + device sync) was used to pick batch size befo
 | Sparse, naive dispatch | 1,057 ms | 969 tok/s |
 | Sparse, vectorized dispatch | 919 ms | **1,114 tok/s** |
 
-The naive dispatcher spent **51%** of MoE forward on per-expert `torch.where`. Vectorizing dispatch made that phase **2.6×** faster (234 ms → 89 ms) and the full MoE forward **1.6×** faster. End-to-end training TPUT moved 969 → 1,114 tok/s (**1.15×**); backward is now a large remaining share of the step.
+The naive dispatcher spends **51% of MoE forward time** in per-expert torch.where. Vectorizing dispatch makes this phase **2.6× faster** (234 ms → 89 ms) and the overall MoE forward pass **1.6× faster**. End-to-end training throughput improves from **969 → 1,114 tok/s (1.15×)**.
 
 ![Naive vs vectorized MoE dispatcher](docs/figures/moe_tput_naive_vs_vectorized.png)
 
-*Train-step, forward, and MoE-internal breakdown: naive vs vectorized dispatch.*
+### Dense vs MoE: A Note on the Results
 
----
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- **Same training budget:** Both models were trained with the same setup on **20.5M TinyStories tokens**.
+- **Validation loss:** The dense model achieves a slightly better best validation loss (**2.034 vs. 2.160**).
+- **Why MoE does not show an advantage here:** At this relatively small model and training scale, the benefits of sparse expert specialization are unlikely to fully emerge.
+- **Dataset:** TinyStories is also not sufficiently large or diverse to fully exploit the specialization that MoE architectures are designed to provide.
+- **Purpose of the MoE implementation:** The focus was on understanding the **MoE architecture, sparse expert routing, capacity management, and load balancing**, while achieving stable training of a sparse LLM.
 
 ---
 
 ## Citation
 
-If this repo is useful, please cite the original papers the architecture draws from:
-
-1. [Vaswani et al., 2017](https://arxiv.org/abs/1706.03762) — Attention Is All You Need
-2. [Ainslie et al., 2023](https://arxiv.org/abs/2305.13245) — GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints
-3. [Su et al., 2021](https://arxiv.org/abs/2104.09864) — RoFormer: Enhanced Transformer with Rotary Position Embedding
-4. [Fedus et al., 2021](https://arxiv.org/abs/2101.03961) — Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity
-5. [DeepSeek-AI, 2024](https://arxiv.org/abs/2405.04434) — DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model (MLA, aux-loss-free balancing)
-6. [DeepSeek-AI, 2024](https://arxiv.org/abs/2412.19437) — DeepSeek-V3 Technical Report
-7. [Eldan & Li, 2023](https://arxiv.org/abs/2305.07759) — TinyStories: How Small Can Language Models Be and Still Speak Coherent English?
-
 ```bibtex
-@software{dutta_llm_from_scratch,
+@software{llm_from_scratch,
   title  = {LLM from Scratch},
   author = {Dutta, Iraban},
   year   = {2026},
   url    = {https://github.com/iraban-dutta/llm-from-scratch},
-  note   = {Decoder-only Transformer in PyTorch: MHA/GQA/MHLA, RoPE, KV cache, dense and MoE}
+  note   = {Decoder-only Transformer in PyTorch: MHA/GQA/MHLA, RoPE, KV cache, dense and MoE, train run on TinyStories}
 }
 ```
-
----
-
-## Author
-
-[Iraban Dutta](https://www.linkedin.com/in/iraban-dutta/) · [GitHub](https://github.com/iraban-dutta)
