@@ -23,6 +23,18 @@ The posts below walk through the codebase and its implementation in detail:
 
 ---
 
+## Contents
+
+- [Technical blogs](#technical-blogs)
+- [What this repo implements](#what-this-repo-implements)
+- [Project structure](#project-structure)
+- [Setup](#setup)
+- [Running the project](#running-the-project)
+- [Configs](#configs)
+- [Experiments and Results](#experiments-and-results)
+
+---
+
 ## What this repo implements
 
 | Area | Implemented |
@@ -351,6 +363,8 @@ The naive dispatcher spends **51% of MoE forward time** in per-expert torch.wher
 ---
 
 ## Citation
+
+In case you choose to cite this work, please use the citation below:
 
 ```bibtex
 @software{llm_from_scratch,
