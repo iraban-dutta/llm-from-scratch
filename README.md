@@ -25,7 +25,6 @@ The posts below walk through the codebase and its implementation in detail:
 
 ## Contents
 
-- [Technical blogs](#technical-blogs)
 - [What this repo implements](#what-this-repo-implements)
 - [Project structure](#project-structure)
 - [Setup](#setup)
