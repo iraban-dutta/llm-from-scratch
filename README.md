@@ -1,18 +1,17 @@
 # LLM from Scratch
 
-A from-scratch PyTorch implementation of a modern decoder-only Transformer — **dense and Mixture-of-Experts** — trained on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories).
-
-The goal is to understand LLM internals by implementing them: attention variants, rotary position embeddings, KV caching, pre-norm residual scaling, sparse expert routing, and a training loop that is close to what production setups actually do (AdamW with decoupled decay, cosine LR, gradient clipping, checkpoint/resume, evaluation).
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
+
+A from-scratch PyTorch implementation of a modern decoder-only LLM, including both **dense** and **sparse (MoE)** variants, trained on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories).
+This is an educational repository focused on understanding, implementing, and experimenting with the core components of an LLM, rather than treating the model as a black box.
 
 ---
 
 ## Technical blogs
 
-The series that walks through this codebase, from dense training through sparse MoE optimization:
+The posts below walk through the codebase and its implementation in detail:
 
 - [LLM From Scratch 1: Training a Dense LLM](https://iraban-dutta.github.io/from-first-principles/posts/llm4mscratch1_training-a-dense-llm/) — architecture choices, data pipeline, training loop, TinyStories run, throughput
 <!--
@@ -28,14 +27,15 @@ The series that walks through this codebase, from dense training through sparse 
 
 | Area | Implemented |
 |------|-------------|
-| **Attention** | Multi-Head (MHA), Grouped-Query (GQA; `n_groups=1` is MQA), Multi-Head Latent (MHLA, DeepSeek-V2 style). Manual attention and Flash Attention via `scaled_dot_product_attention`. |
-| **Position** | Sinusoidal PE, learned PE, RoPE. Enabling RoPE bypasses absolute PE (`nn.Identity`). |
-| **Feed-forward** | Dense GELU MLP, or sparse MoE (top-*k* routing, capacity factor, shared experts, noisy router). |
-| **MoE balancing** | Switch-style importance / load-balance auxiliary losses, and DeepSeek-style **auxiliary-loss-free** expert-bias updates. |
-| **MoE dispatch** | Legacy per-expert `torch.where` path and a **vectorized** dispatcher (`scatter` / `cumsum` / capacity mask). |
-| **Normalization** | Pre-norm decoder blocks, LayerNorm, residual-write init scaled by $1/\sqrt{2L}$. |
-| **Inference** | KV cache (MHA / GQA), sliding context once `ctx_len` is full, greedy / random / top-*k* sampling, cached vs naive timing. |
-| **Training** | Token `memmap` loader, AdamW with 2D-vs-1D decay split, fused AdamW on CUDA, linear warmup + cosine decay, grad clip, val eval, `best.pt` / `latest.pt`, resume, MoE routing CSV logs. |
+| **Attention** | MHA, GQA, MQA, MHLA (DeepSeek-V2 style). |
+| **Positional information** | Absolute positional information — (sinusoidal and learned), and relative positional information through RoPE. |
+| **Normalization** | Pre-norm Transformer blocks with LayerNorm. |
+| **Feed-forward** | Dense GELU MLP or sparse Mixture-of-Experts (MoE) layers. |
+| **Mixture-of-Experts** | Top-*k* expert routing, capacity management, shared experts, noisy routing, auxiliary-loss-based load balancing, and auxiliary-loss-free balancing using dynamic expert biases (DeepSeek-V3 style). |
+| **Data pipeline** | End-to-end pipeline for downloading TinyStories from the Hugging Face Hub, tokenization, binary storage using `memmap`, and batched data loading for training. |
+| **Training pipeline** | End-to-end training with AdamW, decoupled weight decay, learning-rate warmup and cosine decay, gradient clipping, validation, checkpointing, checkpoint resume, and MoE routing metrics. |
+| **Inference pipeline** | KV caching, sliding-context inference, greedy/random/top-*k* sampling, and cached vs. naive generation benchmarking. |
+| **Benchmarking** | Training throughput and batch-size sweeps, dense vs MoE performance, forward/backward/optimizer time breakdowns, MoE routing and dispatch profiling, and naive vs vectorized dispatch comparisons. |
 
 ---
 
@@ -44,82 +44,82 @@ The series that walks through this codebase, from dense training through sparse 
 ```
 llm-from-scratch/
 ├── config/
-│   ├── constants.py          # vocab, data paths, tokenizer / sampling enums
-│   ├── dense_default.py      # dense TinyStories run
-│   └── moe_default.py        # sparse TinyStories run
+│   ├── constants.py               
+│   ├── dense_default.py              # dense TinyStories run
+│   └── moe_default.py                # sparse TinyStories run
 │
-├── main/                     # CLI entry points (python -m ...)
-│   ├── download_preprocess.py
-│   ├── train.py
-│   ├── infer.py
-│   ├── train_benchmark.py            # tokens/s of a full train step
-│   ├── train_benchmark_detailed.py   # dense vs MoE, stage breakdown
-│   └── tune_moe_routing.py           # short sweep over balancing configs
+├── main/                             # CLI entry points (python -m ...)
+│   ├── download_preprocess.py        # script to download data, tokenize and dump it in local disk
+│   ├── train.py                      # script to trigger training
+│   ├── infer.py                      # script to trigger inference
+│   ├── train_benchmark.py            # script to check tokens/s of a full train step
+│   ├── train_benchmark_detailed.py   # script to profile dense vs sparse train time in detail 
+│   └── tune_moe_routing.py           # script that runs a short sweep over balancing configs
 │
 ├── src/
 │   ├── model/
-│   │   ├── llm.py                 # Transformer + weight tying + init
-│   │   ├── llm_config.py          # LLMConfig + validation
-│   │   ├── layers.py              # pre-norm decoder block
-│   │   ├── attention.py           # MHA, GQA, MHLA, flash / manual
-│   │   ├── position_embedding.py  # sinusoidal, learned, RoPE
-│   │   ├── moe.py                 # dense MLP + MoE (route / dispatch / combine)
-│   │   └── normalization.py       # LayerNorm
-│   ├── data/                      # TinyStories download, GPT-2 tokenize, .bin
+│   │   ├── llm.py                    # Transformer + weight tying + init
+│   │   ├── llm_config.py             # LLMConfig + validation
+│   │   ├── layers.py                 # pre-norm decoder block
+│   │   ├── attention.py              # MHA, GQA, MHLA
+│   │   ├── position_embedding.py     # sinusoidal, learned, RoPE
+│   │   ├── moe.py                    # dense MLP + MoE (route / dispatch / combine)
+│   │   └── normalization.py          # LayerNorm
+│   ├── data/                      
+│   │   ├── downloader.py             # TinyStories download
+│   │   ├── preprocessor.py           # Saving as .bin file
+│   │   ├── tokenizer.py              # GPT-2 tokenize
 │   ├── training/
-│   │   ├── trainer.py             # loop, AdamW, cosine LR, ckpt, MoE logs
+│   │   ├── trainer.py                # dataloader, train-loop, AdamW, cosine LR, checkpointing, logs
 │   │   └── moe_routing_metrics.py
 │   └── inference/
-│       ├── cache.py               # KV cache (prefill, decode, sliding window)
-│       └── generate.py            # sampling + naive vs cached generate
+│       ├── cache.py                  # KV cache (prefill, decode, sliding window)
+│       └── generate.py               # sampling + naive vs cached generate
 │
-├── docs/figures/             # plots used in this README
-├── logs/                     # per-run config.json, train.log, moe_stats.csv
-└── checkpoints/              # best.pt, latest.pt
+├── data/                             # dump raw data from HF and tokenized data as .bin file 
+├── logs/                             # per-run config.json, train.log, moe_stats.csv
+└── checkpoints/                      # best.pt, latest.pt
+
 ```
 
 ---
 
 ## Setup
 
-Python 3.11, PyTorch 2.x. CUDA, Apple Silicon (MPS), and CPU all work; `device="auto"` picks CUDA → MPS → CPU.
-
 ```bash
 git clone https://github.com/iraban-dutta/llm-from-scratch.git
 cd llm-from-scratch
 
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+python3.11 -m venv .venv
+source .venv/bin/activate
 
-pip install torch numpy einops tiktoken datasets matplotlib
+pip install -r requirements.txt
 ```
-
-TinyStories is downloaded from Hugging Face on first run of the preprocess script (needs network). Tokenized data is written to `data/tinystories/processed/{train,val}.bin` as `uint16` and read with `numpy.memmap` during training.
 
 ---
 
-## Running
+## Running the project
 
-All commands are from the repo root.
-
-### 1. Download and tokenize TinyStories
+### 1. Prepare the dataset
 
 ```bash
+# Download and tokenize TinyStories
 python -m main.download_preprocess
 ```
 
 ### 2. Train
 
 ```bash
-python -m main.train --help
-
-# Dense (defaults from config.dense_default)
+# Dense model
 python -m main.train --config config.dense_default
 
-# Sparse MoE
+# Sparse (MoE) model
 python -m main.train --config config.moe_default
 
-# Trainer overrides (model shape still comes from the config module)
+# Check CLI structure
+python -m main.train --help
+
+# Train with CLI overrides
 python -m main.train --config config.dense_default \
   --batch-size 16 \
   --lr 6e-4 \
@@ -128,75 +128,76 @@ python -m main.train --config config.dense_default \
   --checkpoint-interval 1000
 ```
 
-Disable checkpoint writes with `--no-to-save-checkpoint`. Each run writes `logs/<timestamp>/config.json` and `train.log`. MoE runs also write `moe_stats.csv` (per-layer token fraction, importance, drops, expert bias).
-
-### 3. Resume
-
-Model config is restored from the checkpoint, not from `--config`. Trainer fields can still be overridden.
+### 3. Resume training
 
 ```bash
-python -m main.train --resume checkpoints/<run>/latest.pt \
+# Resume from the latest checkpoint
+# Model config is restored from the checkpoint, not from `--config`
+# Trainer config can still be overridden.
+python -m main.train \
+  --resume checkpoints/<run>/latest.pt \
   --log-interval 10 \
   --eval-interval 100 \
-  --to-save-checkpoint \
   --checkpoint-interval 1000
 ```
 
-### 4. Inference
+### 4. Run inference
 
 ```bash
+# Check CLI structure
 python -m main.infer --help
 
-# From a trained checkpoint (weights + model config from the .pt)
-python -m main.infer --ckpt checkpoints/<run>/best.pt
+# Generate text from a randomly initialized model
+python -m main.infer --config config.dense_default --prompt "Hey, hi"
 
-python -m main.infer --ckpt checkpoints/<run>/best.pt \
+# Generate text from a trained checkpoint
+python -m main.infer \
+  --ckpt checkpoints/<run>/best.pt \
   --prompt "Once upon a time" \
-  --num-samples 5 \
   --max-new-tokens 50 \
   --strategy topk \
   --temperature 1.0 \
   --top-k 50
 
-# Smoke-test the generate path with random weights
-python -m main.infer --config config.dense_default --prompt "Once upon a time"
-
-# Time cached decode against the naive recompute loop
-python -m main.infer --ckpt checkpoints/<run>/best.pt --benchmark
+# Benchmark cached vs. naive inference
+python -m main.infer \
+  --ckpt checkpoints/<run>/best.pt \
+  --benchmark
 ```
 
-Sampling: `greedy`, `random`, `topk`. `--naive` turns off the KV cache.
-
-### 5. Throughput benchmark
-
-Short timed train-step loop (warmup + synced device) for picking batch size before a long run:
+### 5. Benchmark training performance
 
 ```bash
+# ================================
+# train_benchmark.py
+# ================================
+# Short timed train-step loop (warmup + synced device) for picking batch size before a long run
 python -m main.train_benchmark --config config.dense_default
-python -m main.train_benchmark --config config.dense_default --batch-size 16
-python -m main.train_benchmark --config config.moe_default
-```
 
-Dense vs MoE stage breakdown (forward / backward / optimizer, and MoE route–dispatch–GEMM–combine). Toggles are at the top of `main/train_benchmark_detailed.py` (`USE_MOE`, `USE_VECTORIZED_DISPATCH`, `TOPK`, `CAPACITY_FACTOR`):
+# Compare a different batch size
+python -m main.train_benchmark \
+  --config config.dense_default \
+  --batch-size 16
 
-```bash
-PYTHONUNBUFFERED=1 python -m main.train_benchmark_detailed
+# ================================
+# train_benchmark_detailed.py
+# ================================
+# Dense vs MoE TPUT: Detailed forward / backward / optimizer time breakdown
+# Toggles are at the top of main/train_benchmark_detailed.py: (USE_MOE, USE_VECTORIZED_DISPATCH, TOPK, CAPACITY_FACTOR)
+python -m main.train_benchmark_detailed
 ```
 
 ### 6. Tune MoE load balancing
 
-Short sweep over baseline / noisy-router / aux-loss-free γ values. Writes routing plots and a ranking table (CV, max-load, drop rate, loss).
-
 ```bash
+# Short sweep to find the best hyperparameters for load balance.
+# Writes routing plots and a ranking table (CV, max-load, drop rate, loss).
 python -m main.tune_moe_routing
 
-# Replot an existing sweep without training
-python -m main.tune_moe_routing --analyze-only logs/moe_routing_tune/<run>
+# Analyze an existing sweep
+python -m main.tune_moe_routing \
+  --analyze-only logs/moe_routing_tune/<run>
 ```
-
-Phase, step count, and candidate configs are at the top of `main/tune_moe_routing.py`.
-
-Each train step: next `(B, T)` batch from a contiguous `memmap` of token ids → forward (optional MoE aux losses added to CE) → backward → clip → AdamW. Matrices (`ndim >= 2`) get weight decay; vectors (LayerNorm scale, biases) do not. LR is linear warmup, then cosine down to `min_lr`. `best.pt` is the lowest val loss. Resume restores weights, optimizer, RNG, and the loader offset.
 
 ---
 
